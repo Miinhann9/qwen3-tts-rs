@@ -299,20 +299,21 @@ cargo build --release --features flash-attn,cli
 
 ### Docker
 
-A Dockerfile is included that builds on the [NGC PyTorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) (CUDA toolkit + cuDNN + NCCL).
+For GPU builds, use the build script which auto-detects your GPU architecture:
 
 ```bash
-# Build GPU image (flash attention + CUDA)
-docker build -t qwen3-tts .
+# Build GPU image (auto-detects compute capability)
+./build-docker.sh qwen3-tts flash-attn,cli
 
-# Build CPU-only image (smaller, no CUDA)
-docker build --build-arg FEATURES=cli --build-arg BASE=ubuntu:22.04 -t qwen3-tts-cpu .
+# Build CPU-only image
+./build-docker.sh qwen3-tts-cpu cli
 ```
 
-Run inference (mount your models and output directory):
+The script builds inside a running container with GPU access, ensuring correct PTX compilation for your exact hardware (Ampere, Ada, Hopper, Blackwell, etc.).
+
+Run inference:
 
 ```bash
-# GPU inference
 docker run --gpus all \
   -v /path/to/models:/models \
   -v /path/to/output:/output \
@@ -322,29 +323,18 @@ docker run --gpus all \
     --text "Hello world, this is a test." \
     --device cuda \
     --output /output/hello.wav
-
-# CPU inference
-docker run \
-  -v /path/to/models:/models \
-  -v /path/to/output:/output \
-  qwen3-tts-cpu \
-    --model-dir /models/0.6b-customvoice \
-    --speaker ryan \
-    --text "Hello world, this is a test." \
-    --output /output/hello.wav
 ```
 
-The default `CUDA_COMPUTE_CAP=90` targets Hopper GPUs (GH200). Override for other architectures:
+For CPU-only builds without GPU access, use the Dockerfile directly:
 
 ```bash
-docker build --build-arg CUDA_COMPUTE_CAP=89 -t qwen3-tts .  # Ada (RTX 4090)
-docker build --build-arg CUDA_COMPUTE_CAP=80 -t qwen3-tts .  # Ampere (A100)
+docker build --build-arg FEATURES=cli --build-arg BASE=ubuntu:22.04 -t qwen3-tts-cpu .
 ```
 
 ### Dtype behavior
 
-| Component | CPU | CUDA | CUDA + flash-attn |
-|-----------|-----|------|--------------------|
+| Component | CPU | CUDA/Metal | CUDA + flash-attn |
+|-----------|-----|------------|--------------------|
 | Talker (transformer) | F32 | BF16 | BF16 |
 | Code Predictor | F32 | BF16 | BF16 |
 | Codec Decoder | F32 | F32 | F32 |
