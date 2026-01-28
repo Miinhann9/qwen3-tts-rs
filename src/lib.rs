@@ -158,8 +158,8 @@ impl Qwen3TTS {
     pub fn from_pretrained(model_id: &str, device: Device) -> Result<Self> {
         tracing::info!("Loading Qwen3-TTS from: {}", model_id);
 
-        // BF16 on CUDA for flash-attn compatibility, F32 elsewhere
-        let compute_dtype = if device.is_cuda() {
+        // BF16 on CUDA/Metal for half-precision acceleration, F32 on CPU
+        let compute_dtype = if device.is_cuda() || device.is_metal() {
             DType::BF16
         } else {
             DType::F32
@@ -286,7 +286,7 @@ impl Qwen3TTS {
         text_tokenizer: tokenizer::TextTokenizer,
         device: &Device,
     ) -> Result<Self> {
-        let compute_dtype = if device.is_cuda() {
+        let compute_dtype = if device.is_cuda() || device.is_metal() {
             DType::BF16
         } else {
             DType::F32
@@ -362,7 +362,7 @@ impl Qwen3TTS {
     pub fn from_paths(paths: &hub::ModelPaths, device: Device) -> Result<Self> {
         tracing::info!("Loading Qwen3-TTS from downloaded paths...");
 
-        let compute_dtype = if device.is_cuda() {
+        let compute_dtype = if device.is_cuda() || device.is_metal() {
             DType::BF16
         } else {
             DType::F32
