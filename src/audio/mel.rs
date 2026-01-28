@@ -132,7 +132,7 @@ impl MelSpectrogram {
 
     /// Compute mel spectrogram for the speaker encoder.
     ///
-    /// Differs from [`compute`] in two ways:
+    /// Differs from [`Self::compute`] in two ways:
     /// - Uses **magnitude** spectrum (`sqrt(re² + im² + 1e-9)`) rather than power spectrum
     /// - Applies `log(clamp(mel, 1e-5))` compression
     ///

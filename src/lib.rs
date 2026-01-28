@@ -620,7 +620,7 @@ impl Qwen3TTS {
 
     /// Synthesize speech using a text-described voice (VoiceDesign model).
     ///
-    /// Uses the same generation loop as [`synthesize_with_voice`] but runs the
+    /// Uses the same generation loop as [`Self::synthesize_with_voice`] but runs the
     /// VoiceDesign prefill instead of the predefined-speaker prefill. The voice
     /// is conditioned on a natural language description (e.g., "A cheerful young
     /// female voice with high pitch and energetic tone").
@@ -1081,7 +1081,7 @@ impl Qwen3TTS {
 
     /// Synthesize speech using a cloned voice.
     ///
-    /// Uses the same generation loop as [`synthesize_with_voice`] but runs the
+    /// Uses the same generation loop as [`Self::synthesize_with_voice`] but runs the
     /// voice-clone prefill instead of the predefined-speaker prefill.
     ///
     /// When the prompt contains ICL data (ref_codes + ref_text_ids), the model
