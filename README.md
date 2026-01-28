@@ -10,6 +10,7 @@ Pure Rust inference for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), a high
 - **Streaming synthesis** for low-latency audio output
 - **Voice cloning** from reference audio (Base models)
 - **Preset speakers** with 9 built-in voices (CustomVoice models)
+- **Text-described voices** via natural language prompts (VoiceDesign models)
 - **Auto-detection** of model variant from `config.json`
 - **HuggingFace Hub integration** for easy model downloads
 
@@ -29,7 +30,7 @@ Five official model variants exist across two size classes. Each variant support
 
 - **Want to clone a specific voice?** Use a **Base** model with `--ref-audio`.
 - **Want a quick preset voice?** Use a **CustomVoice** model with `--speaker`.
-- **Want to describe a voice in text?** Use **1.7B VoiceDesign** (not yet implemented in CLI).
+- **Want to describe a voice in text?** Use **1.7B VoiceDesign** with `--instruct`.
 - **Unsure?** Start with **0.6B CustomVoice** for the fastest results.
 
 ### Valid combinations
@@ -113,6 +114,26 @@ fn main() -> anyhow::Result<()> {
         None,
     )?;
     audio.save("cloned.wav")?;
+    Ok(())
+}
+```
+
+### Text-described voice (VoiceDesign)
+
+```rust
+use qwen3_tts::{Qwen3TTS, Language, auto_device};
+
+fn main() -> anyhow::Result<()> {
+    let device = auto_device()?;
+    let model = Qwen3TTS::from_pretrained("path/to/voicedesign_model", device)?;
+
+    let audio = model.synthesize_voice_design(
+        "Hello from a designed voice!",
+        "A cheerful young female voice with high pitch and energetic tone",
+        Language::English,
+        None,
+    )?;
+    audio.save("designed.wav")?;
     Ok(())
 }
 ```
@@ -228,6 +249,14 @@ cargo run --release --features cli --bin generate_audio -- \
   --ref-audio reference.wav \
   --ref-text "transcript of the reference audio"
 
+# VoiceDesign: describe the voice you want
+cargo run --release --features cli --bin generate_audio -- \
+  --model-dir path/to/voicedesign \
+  --text "Hello world" \
+  --instruct "A cheerful young female voice with high pitch and energetic tone" \
+  --language english \
+  --duration 3.0
+
 # Reproducible generation with fixed seed
 cargo run --release --features cli --bin generate_audio -- \
   --model-dir path/to/model \
@@ -244,8 +273,12 @@ cargo run --release --features cli --bin generate_audio -- \
 | `--text` | `"Hello"` | Text to synthesize |
 | `--speaker` | `ryan` | Preset speaker (CustomVoice only) |
 | `--language` | `english` | Target language |
+| `--instruct` | | Voice description for VoiceDesign models |
 | `--ref-audio` | | Reference audio WAV for voice cloning (Base only) |
 | `--ref-text` | | Reference transcript for ICL mode |
+| `--x-vector-only` | | Speaker embedding only, no ICL (use with `--ref-audio`) |
+| `--output` | | Output WAV file path (overrides default naming) |
+| `--device` | `auto` | Device: `auto`, `cpu`, `cuda`, `cuda:N`, `metal` |
 | `--duration` | | Duration in seconds |
 | `--frames` | `25` | Number of frames (if no duration) |
 | `--temperature` | `0.7` | Sampling temperature |
@@ -264,33 +297,48 @@ For best performance, build with Flash Attention 2 (requires CUDA toolkit in `PA
 cargo build --release --features flash-attn,cli
 ```
 
-### Building in an NGC container
+### Docker
 
-If your host lacks a CUDA toolkit, use an [NGC PyTorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch):
+A Dockerfile is included that builds on the [NGC PyTorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) (CUDA toolkit + cuDNN + NCCL).
 
 ```bash
-docker run -d --name qwen3-build --gpus all \
-  -v $(pwd):/workspace/project \
-  nvcr.io/nvidia/pytorch:25.12-py3 sleep infinity
+# Build GPU image (flash attention + CUDA)
+docker build -t qwen3-tts .
 
-# Install Rust
-docker exec qwen3-build bash -c \
-  'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+# Build CPU-only image (smaller, no CUDA)
+docker build --build-arg FEATURES=cli --build-arg BASE=ubuntu:22.04 -t qwen3-tts-cpu .
+```
 
-# Build with flash-attn
-docker exec qwen3-build bash -c \
-  'source ~/.cargo/env && cd /workspace/project && cargo build --release --features flash-attn,cli'
+Run inference (mount your models and output directory):
 
-# Run inference
-docker exec qwen3-build bash -c \
-  'source ~/.cargo/env && cd /workspace/project && \
-   ./target/release/generate_audio \
-     --model-dir test_data/models/1.7b-base \
-     --text "Hello world" \
-     --ref-audio examples/data/reference.wav \
-     --ref-text "Transcript of reference audio." \
-     --device cuda --seed 42 --duration 8 \
-     --output /tmp/output.wav'
+```bash
+# GPU inference
+docker run --gpus all \
+  -v /path/to/models:/models \
+  -v /path/to/output:/output \
+  qwen3-tts \
+    --model-dir /models/0.6b-customvoice \
+    --speaker ryan \
+    --text "Hello world, this is a test." \
+    --device cuda \
+    --output /output/hello.wav
+
+# CPU inference
+docker run \
+  -v /path/to/models:/models \
+  -v /path/to/output:/output \
+  qwen3-tts-cpu \
+    --model-dir /models/0.6b-customvoice \
+    --speaker ryan \
+    --text "Hello world, this is a test." \
+    --output /output/hello.wav
+```
+
+The default `CUDA_COMPUTE_CAP=90` targets Hopper GPUs (GH200). Override for other architectures:
+
+```bash
+docker build --build-arg CUDA_COMPUTE_CAP=89 -t qwen3-tts .  # Ada (RTX 4090)
+docker build --build-arg CUDA_COMPUTE_CAP=80 -t qwen3-tts .  # Ampere (A100)
 ```
 
 ### Dtype behavior
