@@ -130,7 +130,10 @@ def parse_args() -> argparse.Namespace:
         help="Voice description for VoiceDesign models.",
     )
     p.add_argument(
-        "--duration", type=float, default=3.0, help="Duration in seconds (default: 3.0)."
+        "--duration",
+        type=float,
+        default=None,
+        help="Max duration in seconds (default: no limit, stops at EOS).",
     )
     p.add_argument(
         "--readme", action="store_true", help="Generate curated README samples to assets/."
@@ -355,7 +358,7 @@ def run_test(
     device: str,
     seed: int,
     text: str,
-    duration: float,
+    duration: float | None,
     output_path: Path,
 ) -> TestResult:
     cmd = [
@@ -365,13 +368,13 @@ def run_test(
         *test.extra_args,
         "--text",
         text,
-        "--duration",
-        str(duration),
         "--seed",
         str(seed),
         "--output",
         str(output_path),
     ]
+    if duration is not None:
+        cmd.extend(["--duration", str(duration)])
 
     t0 = time.monotonic()
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -684,7 +687,7 @@ def run_readme_samples(
     """Generate curated README samples: WAV + combined PNG."""
     device = devices[0]
     seed = 42
-    duration = 5.0
+    duration = None  # no cap — generate until EOS
 
     audio_dir = repo_root / "assets" / "audio"
     image_dir = repo_root / "assets" / "images"
@@ -739,13 +742,13 @@ def run_readme_samples(
             *extra,
             "--text",
             README_TEXT,
-            "--duration",
-            str(duration),
             "--seed",
             str(seed),
             "--output",
             str(wav_path),
         ]
+        if duration is not None:
+            cmd.extend(["--duration", str(duration)])
 
         t0 = time.monotonic()
         result = subprocess.run(cmd, capture_output=True, text=True)

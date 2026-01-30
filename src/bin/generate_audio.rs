@@ -4,8 +4,8 @@
 //! specific seed, allowing direct comparison with Python output.
 //!
 //! Usage:
-//!     cargo run --features cli --bin generate_audio -- --text "Hello" --seed 42 --frames 25
-//!     cargo run --features cli --bin generate_audio -- --text "Hello" --seed 42 --duration 2.0
+//!     cargo run --features cli --bin generate_audio -- --text "Hello" --seed 42
+//!     cargo run --features cli --bin generate_audio -- --text "Hello" --seed 42 --duration 10.0
 
 use anyhow::Result;
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -36,11 +36,13 @@ struct Args {
     #[arg(short, long, default_value_t = 42)]
     seed: u64,
 
-    /// Number of frames to generate (overridden by duration if specified)
-    #[arg(short, long, default_value_t = 25)]
+    /// Maximum number of frames to generate (default: 2048, ~164s). Generation
+    /// stops early when the model emits an end-of-sequence token.
+    #[arg(short, long, default_value_t = 2048)]
     frames: usize,
 
-    /// Duration in seconds (overrides frames if specified)
+    /// Maximum duration in seconds (overrides --frames if specified).
+    /// Generation stops early when the model emits an end-of-sequence token.
     #[arg(short, long)]
     duration: Option<f64>,
 

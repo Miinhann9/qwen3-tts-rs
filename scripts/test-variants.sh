@@ -27,7 +27,7 @@ TEXT="Hello world, this is a test."
 INSTRUCT="A cheerful young female voice with clear pronunciation and natural intonation."
 OUTPUT_BASE="$REPO_ROOT/test_data/variant_tests"
 SEED=42
-DURATION=3.0
+DURATION=""
 
 # Parse arguments
 DEVICES=()
@@ -63,7 +63,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --port P        HTTP server port (default: 8765)."
             echo "  --text TEXT     Text to synthesize (default: \"Hello world, this is a test.\")."
             echo "  --seed N        Base seed (default: 42). Combined with --random, this is ignored."
-            echo "  --duration S    Duration in seconds (default: 3.0)."
+            echo "  --duration S    Max duration in seconds (default: no limit, stops at EOS)."
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -277,9 +277,11 @@ for device in "${DEVICES[@]}"; do
 
             # Run and capture time
             start_time=$(date +%s%N)
+            duration_args=()
+            [[ -n "$DURATION" ]] && duration_args=(--duration "$DURATION")
             # shellcheck disable=SC2154
             if "$BIN" --device "$device" "${test_args[@]}" \
-                --text "$TEXT" --duration "$DURATION" --seed "$seed" \
+                --text "$TEXT" "${duration_args[@]}" --seed "$seed" \
                 --output "$outfile" >/dev/null 2>&1; then
                 status="PASS"
             else
@@ -460,7 +462,9 @@ HTMLHEAD
     else
         seed_info="Seed: ${SEED}"
     fi
-    echo "<p class=\"meta\">Generated: $(date -Iseconds) &mdash; Text: &quot;${TEXT}&quot; &mdash; ${seed_info} &mdash; Duration: ${DURATION}s</p>"
+    duration_info="${DURATION:+Duration: ${DURATION}s}"
+    duration_info="${duration_info:-Duration: EOS}"
+    echo "<p class=\"meta\">Generated: $(date -Iseconds) &mdash; Text: &quot;${TEXT}&quot; &mdash; ${seed_info} &mdash; ${duration_info}</p>"
 
     # Summary table
     echo "<h2>Summary</h2>"

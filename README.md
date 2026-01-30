@@ -1,6 +1,19 @@
 # qwen3-tts
 
-Pure Rust inference for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), a high-quality text-to-speech model from Alibaba. Built on [candle](https://github.com/huggingface/candle) for zero-dependency ML inference — no Python, no ONNX, no C++ bindings.
+Pure Rust inference for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), a text-to-speech model from Alibaba. Built on [candle](https://github.com/huggingface/candle) — no Python or ONNX runtime required.
+
+All code in this repo was written with [Claude Code](https://claude.ai/code). This is an experiment -- not a production library.
+
+## Known Issues
+
+- **ICL voice cloning produces malformed audio.** The x-vector-only cloning path works well. ICL (in-context learning) mode does not. Use `--x-vector-only` with `--ref-audio`, or use CustomVoice/VoiceDesign models instead.
+
+## Acknowledgements
+
+- [Qwen Team (Alibaba)](https://github.com/QwenLM) — [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) model, weights, and [technical report](https://arxiv.org/abs/2601.15621)
+- [candle](https://github.com/huggingface/candle) — Rust ML framework by [Hugging Face](https://huggingface.co/)
+- [mlx-audio](https://github.com/Blaizzy/mlx-audio) — reference implementation that helped clarify model details
+- [Claude Code](https://claude.ai/code) — wrote the code
 
 ## Features
 
@@ -8,7 +21,7 @@ Pure Rust inference for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), a high
 - **CUDA** support for NVIDIA GPU acceleration with **bf16** and **Flash Attention 2**
 - **Metal** support for Apple Silicon
 - **Streaming synthesis** for low-latency audio output
-- **Voice cloning** from reference audio (Base models)
+- **Voice cloning** via x-vector from reference audio (Base models; ICL mode is broken — see Known Issues)
 - **Preset speakers** with 9 built-in voices (CustomVoice models)
 - **Text-described voices** via natural language prompts (VoiceDesign models)
 - **Auto-detection** of model variant from `config.json`
@@ -27,11 +40,6 @@ All samples generated with 1.7B models, seed 42. Text: *"The sun set behind the 
 
 ![CustomVoice Serena](assets/images/customvoice-serena.png)
 [🔊 Listen](assets/audio/customvoice-serena.wav)
-
-### Voice Clone — ICL
-
-![Voice Clone ICL](assets/images/voiceclone-icl.png)
-[🔊 Listen](assets/audio/voiceclone-icl.wav)
 
 ### VoiceDesign — Radio Announcer
 
@@ -62,7 +70,7 @@ Five official model variants exist across two size classes. Each variant support
 
 ### Which model should I use?
 
-- **Want to clone a specific voice?** Use a **Base** model with `--ref-audio`.
+- **Want to clone a specific voice?** Use a **Base** model with `--ref-audio --x-vector-only`. (ICL mode is broken.)
 - **Want a quick preset voice?** Use a **CustomVoice** model with `--speaker`.
 - **Want to describe a voice in text?** Use **1.7B VoiceDesign** with `--instruct`.
 - **Unsure?** Start with **0.6B CustomVoice** for the fastest results.
@@ -71,7 +79,7 @@ Five official model variants exist across two size classes. Each variant support
 
 | | Preset speakers | Voice clone (x_vector) | Voice clone (ICL) | Text-described voice |
 |---|:-:|:-:|:-:|:-:|
-| **Base** | | x | x | |
+| **Base** | | x | ⚠️ broken | |
 | **CustomVoice** | x | | | |
 | **VoiceDesign** | | | | x |
 
@@ -138,7 +146,7 @@ fn main() -> anyhow::Result<()> {
     // x_vector_only: speaker embedding from reference audio
     let prompt = model.create_voice_clone_prompt(&ref_audio, None)?;
 
-    // ICL mode: also provide the transcript of the reference audio
+    // ICL mode (currently broken — produces garbage audio):
     // let prompt = model.create_voice_clone_prompt(&ref_audio, Some("transcript of ref audio"))?;
 
     let audio = model.synthesize_voice_clone(
@@ -268,7 +276,6 @@ cargo run --release --features cli --bin generate_audio -- \
   --text "Hello world" \
   --speaker ryan \
   --language english \
-  --duration 3.0
 
 # Base: voice cloning (x_vector_only)
 cargo run --release --features cli --bin generate_audio -- \
@@ -276,27 +283,25 @@ cargo run --release --features cli --bin generate_audio -- \
   --text "Hello world" \
   --ref-audio reference.wav
 
-# Base: voice cloning (ICL — higher quality, needs reference transcript)
-cargo run --release --features cli --bin generate_audio -- \
-  --model-dir path/to/base \
-  --text "Hello world" \
-  --ref-audio reference.wav \
-  --ref-text "transcript of the reference audio"
+# Base: voice cloning (ICL — currently broken, produces garbage audio)
+# cargo run --release --features cli --bin generate_audio -- \
+#   --model-dir path/to/base \
+#   --text "Hello world" \
+#   --ref-audio reference.wav \
+#   --ref-text "transcript of the reference audio"
 
 # VoiceDesign: describe the voice you want
 cargo run --release --features cli --bin generate_audio -- \
   --model-dir path/to/voicedesign \
   --text "Hello world" \
   --instruct "A cheerful young female voice with high pitch and energetic tone" \
-  --language english \
-  --duration 3.0
+  --language english
 
 # Reproducible generation with fixed seed
 cargo run --release --features cli --bin generate_audio -- \
   --model-dir path/to/model \
   --text "Hello" \
-  --seed 42 \
-  --frames 25
+  --seed 42
 ```
 
 ### CLI options
@@ -309,12 +314,12 @@ cargo run --release --features cli --bin generate_audio -- \
 | `--language` | `english` | Target language |
 | `--instruct` | | Voice description for VoiceDesign models |
 | `--ref-audio` | | Reference audio WAV for voice cloning (Base only) |
-| `--ref-text` | | Reference transcript for ICL mode |
+| `--ref-text` | | Reference transcript for ICL mode (broken) |
 | `--x-vector-only` | | Speaker embedding only, no ICL (use with `--ref-audio`) |
 | `--output` | | Output WAV file path (overrides default naming) |
 | `--device` | `auto` | Device: `auto`, `cpu`, `cuda`, `cuda:N`, `metal` |
-| `--duration` | | Duration in seconds |
-| `--frames` | `25` | Number of frames (if no duration) |
+| `--duration` | | Max duration in seconds (overrides --frames) |
+| `--frames` | `2048` | Max frames (~164s); generation stops at EOS |
 | `--temperature` | `0.7` | Sampling temperature |
 | `--top-k` | `50` | Top-k sampling |
 | `--top-p` | `0.9` | Nucleus sampling threshold |
