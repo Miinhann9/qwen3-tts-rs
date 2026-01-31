@@ -87,16 +87,21 @@ pub mod generation;
 #[cfg(feature = "hub")]
 pub mod hub;
 pub mod models;
+pub mod profiling;
 pub mod tokenizer;
 
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 use models::codec::{Decoder12Hz, Encoder12Hz};
 use models::speaker::SpeakerEncoder;
 use models::KVCache;
+
+// SynthesisTiming is defined above, already public.
 
 /// Re-exports for convenience
 pub use audio::AudioBuffer;
@@ -126,6 +131,19 @@ pub struct VoiceClonePrompt {
     pub ref_codes: Option<Tensor>,
     /// Tokenized reference text for ICL mode.
     pub ref_text_ids: Option<Vec<u32>>,
+}
+
+/// Per-stage timing breakdown from a synthesis run.
+#[derive(Debug, Clone, Serialize)]
+pub struct SynthesisTiming {
+    /// Time spent in the prefill phase (ms).
+    pub prefill_ms: f64,
+    /// Time spent in the autoregressive generation loop (ms).
+    pub generation_ms: f64,
+    /// Number of codec frames generated.
+    pub generation_frames: usize,
+    /// Time spent decoding codec frames to audio (ms).
+    pub decode_ms: f64,
 }
 
 /// Main TTS interface using proper autoregressive pipeline.
@@ -399,6 +417,89 @@ impl Qwen3TTS {
         self.synthesize_with_voice(text, Speaker::Ryan, Language::English, options)
     }
 
+    /// Synthesize speech with per-stage timing breakdown.
+    ///
+    /// Same as [`synthesize_with_voice`](Self::synthesize_with_voice) but also
+    /// returns a [`SynthesisTiming`] with prefill, generation, and decode durations.
+    /// Uses [`sync_device`] at timing boundaries for accurate GPU measurements.
+    pub fn synthesize_with_timing(
+        &self,
+        text: &str,
+        speaker: Speaker,
+        language: Language,
+        options: Option<SynthesisOptions>,
+    ) -> Result<(AudioBuffer, SynthesisTiming)> {
+        #[cfg(feature = "profiling")]
+        let _span = tracing::info_span!("synthesize").entered();
+
+        let options = options.unwrap_or_default();
+        let mut sampling_ctx = generation::SamplingContext::new(options.seed);
+        let input_ids = self.text_tokenizer.encode(text)?;
+        let gen_config = options.to_gen_config();
+
+        let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
+            self.build_trailing_text(&input_ids)?;
+
+        // -- Prefill --
+        #[cfg(feature = "profiling")]
+        let _prefill_span = tracing::info_span!("prefill").entered();
+
+        sync_device(&self.device)?;
+        let t_prefill = Instant::now();
+
+        let mut kv_caches = self.talker.new_kv_caches();
+        let (hidden, logits) =
+            self.talker
+                .prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
+        let prefill_len = hidden.dim(1)?;
+        let offset = prefill_len;
+        let last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
+
+        sync_device(&self.device)?;
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+
+        #[cfg(feature = "profiling")]
+        drop(_prefill_span);
+
+        // -- Generation --
+        let t_gen = Instant::now();
+
+        let all_codes = self.generate_codes(
+            &gen_config,
+            &mut sampling_ctx,
+            &mut kv_caches,
+            offset,
+            last_hidden,
+            &logits,
+            &trailing_text_hidden,
+            trailing_text_len,
+            &tts_pad_embed,
+        )?;
+
+        sync_device(&self.device)?;
+        let generation_ms = t_gen.elapsed().as_secs_f64() * 1000.0;
+        let generation_frames = all_codes.len();
+
+        // -- Decode --
+        #[cfg(feature = "profiling")]
+        let _decode_span = tracing::info_span!("decode").entered();
+
+        let t_decode = Instant::now();
+        let audio = self.decode_codes(&all_codes)?;
+
+        sync_device(&self.device)?;
+        let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+
+        let timing = SynthesisTiming {
+            prefill_ms,
+            generation_ms,
+            generation_frames,
+            decode_ms,
+        };
+
+        Ok((audio, timing))
+    }
+
     /// Build trailing text embeddings from input token IDs.
     ///
     /// Returns (trailing_text_hidden, trailing_text_len, tts_pad_embed).
@@ -440,15 +541,31 @@ impl Qwen3TTS {
     ) -> Result<FrameCodes> {
         let mut generated_tokens: Vec<u32> = Vec::new();
 
+        // Pre-build the token suppression mask once (reused every frame)
+        let suppression_mask = generation::build_suppression_mask(
+            codec_tokens::CODEC_VOCAB_SIZE,
+            CODEC_EOS_TOKEN_ID,
+            &self.device,
+        )?;
+
         // Sample first semantic token
         let logits_2d = initial_logits.squeeze(1)?;
-        let logits_2d =
-            self.apply_generation_penalties(&logits_2d, &generated_tokens, gen_config, 0)?;
+        let logits_2d = self.apply_generation_penalties(
+            &logits_2d,
+            &generated_tokens,
+            gen_config,
+            0,
+            Some(&suppression_mask),
+        )?;
         let first_token = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
+        tracing::trace!(target: "gpu_sync", "to_vec1 in generate_codes first token");
         let mut semantic_token: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
         generated_tokens.push(semantic_token);
 
         let mut all_codes: FrameCodes = Vec::new();
+
+        #[cfg(feature = "profiling")]
+        let _gen_span = tracing::info_span!("generate_frames").entered();
 
         for frame_idx in 0..gen_config.max_new_tokens {
             if let Some(eos_id) = gen_config.eos_token_id {
@@ -459,17 +576,24 @@ impl Qwen3TTS {
 
             let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
 
-            let acoustic_codes = self
+            #[cfg(feature = "profiling")]
+            let _cp_span = tracing::info_span!("code_predictor", frame = frame_idx).entered();
+
+            let (acoustic_codes, acoustic_codes_tensor) = self
                 .code_predictor
                 .generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+
+            #[cfg(feature = "profiling")]
+            drop(_cp_span);
 
             let mut frame_codes = vec![semantic_token];
             frame_codes.extend(&acoustic_codes);
             all_codes.push(frame_codes);
 
+            // Use GPU tensor directly for embedding lookup (avoids 15 CPU→GPU transfers)
             let acoustic_embed_sum = self
                 .code_predictor
-                .get_acoustic_embeddings_sum(&acoustic_codes, &self.device)?;
+                .get_acoustic_embeddings_sum_from_tensor(&acoustic_codes_tensor)?;
             let summed = semantic_embed.add(&acoustic_embed_sum)?;
 
             let text_addition = if frame_idx < trailing_text_len {
@@ -479,11 +603,20 @@ impl Qwen3TTS {
             };
             let step_input = summed.add(&text_addition)?;
 
+            #[cfg(feature = "profiling")]
+            let _talker_span = tracing::info_span!("talker_step", frame = frame_idx).entered();
+
             let (h, new_logits) =
                 self.talker
                     .generate_step_with_embed(&step_input, kv_caches, offset)?;
             offset += 1;
             last_hidden = h;
+
+            #[cfg(feature = "profiling")]
+            drop(_talker_span);
+
+            #[cfg(feature = "profiling")]
+            let _sample_span = tracing::info_span!("sampling", frame = frame_idx).entered();
 
             let logits_2d = new_logits.squeeze(1)?;
             let logits_2d = self.apply_generation_penalties(
@@ -491,8 +624,10 @@ impl Qwen3TTS {
                 &generated_tokens,
                 gen_config,
                 generated_tokens.len(),
+                Some(&suppression_mask),
             )?;
             let next_token = generation::sample(&logits_2d, gen_config, sampling_ctx)?;
+            tracing::trace!(target: "gpu_sync", "to_vec1 in generate_codes sampling");
             semantic_token = next_token.flatten_all()?.to_vec1::<u32>()?[0];
             generated_tokens.push(semantic_token);
         }
@@ -533,6 +668,9 @@ impl Qwen3TTS {
         language: Language,
         options: Option<SynthesisOptions>,
     ) -> Result<AudioBuffer> {
+        #[cfg(feature = "profiling")]
+        let _span = tracing::info_span!("synthesize").entered();
+
         if let Some(ModelType::Base) = &self.model_type {
             tracing::warn!(
                 "Using preset speaker {:?} on a Base model. Base models are trained for \
@@ -558,6 +696,9 @@ impl Qwen3TTS {
             self.build_trailing_text(&input_ids)?;
 
         // Prefill with CustomVoice format
+        #[cfg(feature = "profiling")]
+        let _prefill_span = tracing::info_span!("prefill").entered();
+
         let mut kv_caches = self.talker.new_kv_caches();
         let (hidden, logits) =
             self.talker
@@ -565,6 +706,9 @@ impl Qwen3TTS {
         let prefill_len = hidden.dim(1)?;
         let offset = prefill_len;
         let last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
+
+        #[cfg(feature = "profiling")]
+        drop(_prefill_span);
 
         let all_codes = self.generate_codes(
             &gen_config,
@@ -579,6 +723,9 @@ impl Qwen3TTS {
         )?;
 
         // Decode to audio
+        #[cfg(feature = "profiling")]
+        let _decode_span = tracing::info_span!("decode").entered();
+
         self.decode_codes(&all_codes)
     }
 
@@ -605,6 +752,9 @@ impl Qwen3TTS {
         language: Language,
         options: Option<SynthesisOptions>,
     ) -> Result<AudioBuffer> {
+        #[cfg(feature = "profiling")]
+        let _span = tracing::info_span!("synthesize").entered();
+
         if let Some(ref mt) = self.model_type {
             if *mt != ModelType::VoiceDesign {
                 tracing::warn!(
@@ -629,6 +779,9 @@ impl Qwen3TTS {
             self.build_trailing_text(&input_ids)?;
 
         // Prefill with VoiceDesign format
+        #[cfg(feature = "profiling")]
+        let _prefill_span = tracing::info_span!("prefill").entered();
+
         let mut kv_caches = self.talker.new_kv_caches();
         let (hidden, logits) = self.talker.prefill_voice_design(
             &input_ids,
@@ -639,6 +792,9 @@ impl Qwen3TTS {
         let prefill_len = hidden.dim(1)?;
         let offset = prefill_len;
         let last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
+
+        #[cfg(feature = "profiling")]
+        drop(_prefill_span);
 
         let all_codes = self.generate_codes(
             &gen_config,
@@ -653,6 +809,9 @@ impl Qwen3TTS {
         )?;
 
         // Decode to audio
+        #[cfg(feature = "profiling")]
+        let _decode_span = tracing::info_span!("decode").entered();
+
         self.decode_codes(&all_codes)
     }
 
@@ -688,6 +847,9 @@ impl Qwen3TTS {
         language: Language,
         options: Option<SynthesisOptions>,
     ) -> Result<(AudioBuffer, FrameCodes)> {
+        #[cfg(feature = "profiling")]
+        let _span = tracing::info_span!("synthesize").entered();
+
         let options = options.unwrap_or_default();
         let mut sampling_ctx = generation::SamplingContext::new(options.seed);
         let input_ids = self.text_tokenizer.encode(text)?;
@@ -716,6 +878,9 @@ impl Qwen3TTS {
         let speaker_embed = prompt.speaker_embedding.to_dtype(self.compute_dtype)?;
 
         // Voice clone prefill (9 positions for ICL, 10 for x_vector_only)
+        #[cfg(feature = "profiling")]
+        let _prefill_span = tracing::info_span!("prefill").entered();
+
         let mut kv_caches = self.talker.new_kv_caches();
         let (hidden, logits) = self.talker.prefill_voice_clone(
             &input_ids,
@@ -778,6 +943,9 @@ impl Qwen3TTS {
             (trailing, logits)
         };
 
+        #[cfg(feature = "profiling")]
+        drop(_prefill_span);
+
         let trailing_text_len = trailing_text_hidden.dim(1)?;
         let tts_pad_embed = self.talker.get_tts_pad_embed()?;
 
@@ -794,6 +962,9 @@ impl Qwen3TTS {
         )?;
 
         // Prepend ref_codes for ICL decoder context (same fix as synthesize_voice_clone)
+        #[cfg(feature = "profiling")]
+        let _decode_span = tracing::info_span!("decode").entered();
+
         let audio = if let Some(ref_codes) = &prompt.ref_codes {
             let ref_frames = self.tensor_to_frame_codes(ref_codes)?;
             let ref_len = ref_frames.len();
@@ -1009,6 +1180,7 @@ impl Qwen3TTS {
         generated_tokens: &[u32],
         config: &generation::GenerationConfig,
         token_count: usize,
+        suppression_mask: Option<&generation::SuppressionMask>,
     ) -> Result<Tensor> {
         // Cast to F32 for penalty math (model may produce BF16 logits)
         let logits = logits.to_dtype(DType::F32)?;
@@ -1021,27 +1193,33 @@ impl Qwen3TTS {
             logits
         };
 
-        // 2. Token suppression
-        let logits = generation::apply_token_suppression(
-            &logits,
-            codec_tokens::CODEC_VOCAB_SIZE,
-            CODEC_EOS_TOKEN_ID,
-        )?;
+        // 2. Token suppression (use pre-built mask if available)
+        let logits = if let Some(mask) = suppression_mask {
+            generation::apply_token_suppression_with_mask(&logits, mask)?
+        } else {
+            generation::apply_token_suppression(
+                &logits,
+                codec_tokens::CODEC_VOCAB_SIZE,
+                CODEC_EOS_TOKEN_ID,
+            )?
+        };
 
         // 3. Min new tokens: suppress EOS if we haven't generated enough tokens yet
+        //    Uses on-device masking to avoid pulling full logits to CPU.
         if token_count < config.min_new_tokens {
             if let Some(eos_id) = config.eos_token_id {
-                let mut logits_vec: Vec<f32> = logits.flatten_all()?.to_vec1()?;
                 let vocab = logits.dim(1)?;
                 let batch = logits.dim(0)?;
-                for b in 0..batch {
-                    logits_vec[b * vocab + eos_id as usize] = f32::NEG_INFINITY;
-                }
-                return Ok(Tensor::from_vec(
-                    logits_vec,
-                    logits.shape(),
-                    logits.device(),
-                )?);
+                let mut mask_data = vec![0.0f32; vocab];
+                mask_data[eos_id as usize] = 1.0;
+                let eos_mask = Tensor::new(mask_data.as_slice(), logits.device())?
+                    .unsqueeze(0)?
+                    .broadcast_as((batch, vocab))?;
+                let neg_inf = Tensor::new(&[f32::NEG_INFINITY], logits.device())?
+                    .broadcast_as((batch, vocab))?;
+                let zeros = Tensor::zeros((batch, vocab), DType::F32, logits.device())?;
+                let is_eos = eos_mask.gt(&zeros)?;
+                return Ok(is_eos.where_cond(&neg_inf, &logits)?);
             }
         }
 
@@ -1168,6 +1346,24 @@ pub fn compute_dtype_for_device(device: &Device) -> DType {
     }
 }
 
+/// Force the GPU to complete all pending work before returning.
+///
+/// On CUDA/Metal, GPU operations are asynchronous — `Instant::now()` would
+/// measure submission time, not completion time. This helper forces a sync
+/// by creating a tiny tensor and reading it back to the CPU.
+///
+/// On CPU this is a no-op.
+pub fn sync_device(device: &Device) -> Result<()> {
+    match device {
+        Device::Cpu => Ok(()),
+        _ => {
+            // Force a GPU→CPU sync by reading a scalar back
+            let _: Vec<f32> = Tensor::zeros(1, DType::F32, device)?.to_vec1()?;
+            Ok(())
+        }
+    }
+}
+
 /// The codec end-of-sequence token ID (2150).
 ///
 /// Generation stops when this token is sampled. This is in the codec vocabulary
@@ -1208,6 +1404,8 @@ pub struct StreamingSession<'a> {
     tts_pad_embed: Tensor,
     // Track generated semantic tokens for repetition penalty
     generated_tokens: Vec<u32>,
+    // Pre-built suppression mask (reused every frame)
+    suppression_mask: generation::SuppressionMask,
 }
 
 impl<'a> StreamingSession<'a> {
@@ -1233,11 +1431,23 @@ impl<'a> StreamingSession<'a> {
         let prefill_len = hidden.dim(1)?;
         let last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
+        // Build suppression mask once for reuse across all frames
+        let suppression_mask = generation::build_suppression_mask(
+            codec_tokens::CODEC_VOCAB_SIZE,
+            CODEC_EOS_TOKEN_ID,
+            &model.device,
+        )?;
+
         // Sample first token with full penalty pipeline
         let mut generated_tokens: Vec<u32> = Vec::new();
         let logits_2d = logits.squeeze(1)?;
-        let logits_2d =
-            model.apply_generation_penalties(&logits_2d, &generated_tokens, &config, 0)?;
+        let logits_2d = model.apply_generation_penalties(
+            &logits_2d,
+            &generated_tokens,
+            &config,
+            0,
+            Some(&suppression_mask),
+        )?;
         let first_token = generation::sample(&logits_2d, &config, &mut sampling_ctx)?;
         let first_token_id: u32 = first_token.flatten_all()?.to_vec1::<u32>()?[0];
         generated_tokens.push(first_token_id);
@@ -1260,6 +1470,7 @@ impl<'a> StreamingSession<'a> {
             trailing_text_len,
             tts_pad_embed,
             generated_tokens,
+            suppression_mask,
         })
     }
 
@@ -1293,7 +1504,7 @@ impl<'a> StreamingSession<'a> {
             let semantic_embed = self.model.talker.get_codec_embedding(token_id)?;
 
             // Generate 15 acoustic codes
-            let acoustic_codes = self
+            let (acoustic_codes, acoustic_codes_tensor) = self
                 .model
                 .code_predictor
                 .generate_acoustic_codes(&self.last_hidden, &semantic_embed)?;
@@ -1309,7 +1520,7 @@ impl<'a> StreamingSession<'a> {
             let acoustic_embed_sum = self
                 .model
                 .code_predictor
-                .get_acoustic_embeddings_sum(&acoustic_codes, &self.model.device)?;
+                .get_acoustic_embeddings_sum_from_tensor(&acoustic_codes_tensor)?;
             let summed = semantic_embed.add(&acoustic_embed_sum)?;
 
             let text_addition = if frame_idx < self.trailing_text_len {
@@ -1336,6 +1547,7 @@ impl<'a> StreamingSession<'a> {
                 &self.generated_tokens,
                 &self.config,
                 self.generated_tokens.len(),
+                Some(&self.suppression_mask),
             )?;
             let next_token = generation::sample(&logits_2d, &self.config, &mut self.sampling_ctx)?;
             let next_token_id: u32 = next_token.flatten_all()?.to_vec1::<u32>()?[0];

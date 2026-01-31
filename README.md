@@ -6,6 +6,17 @@ All code in this repo was written with [Claude Code](https://claude.ai/code). Th
 
 ## Changelog
 
+### 0.3.0
+
+- GPU-side sampling: batched argmax, on-device top-k/top-p/repetition penalty
+- Eliminated 15 of 16 GPU→CPU syncs per frame in code predictor
+- Cached token suppression mask in streaming sessions
+- Tokenizer fallback from vocab.json + merges.txt when tokenizer.json is unavailable
+- Profiling infrastructure: Chrome tracing, flamegraph, Nsight Systems via Makefile
+- Benchmarked all 4 model variants (0.6B Base, 1.7B Base/CustomVoice/VoiceDesign)
+- Self-contained model directories (removed tokenizer symlinks)
+- Enhanced waveform plots with stats annotation bar
+
 ### 0.2.0
 
 - ICL voice cloning now works correctly with proper reference audio
@@ -39,12 +50,15 @@ Thanks to [u/rngesius](https://www.reddit.com/r/LocalLLaMA/comments/1qqvb79/comm
 ## Performance
 
 Benchmarked on an NVIDIA DGX Spark (GB10 Blackwell, ARM Cortex-X925, 120 GB unified memory).
-1.7B CustomVoice model, default generation parameters, seed 42.
+Default generation parameters, seed 42, 2 warmup + 3 timed iterations.
 
-| Device | RTF (short) | RTF (long) | Tok/s | TTFA | Memory |
-|--------|-------------|------------|-------|------|--------|
-| **CUDA (BF16)** | **0.78** | **0.81** | 16.0 | 630 ms | 765 MB |
-| CPU (F32) | 5.39 | 6.48 | 2.1 | — | 9.1 GB |
+| Model | RTF (short) | RTF (long) | Tok/s | TTFA | Memory |
+|-------|-------------|------------|-------|------|--------|
+| **0.6B Base (CUDA BF16)** | **0.56** | **0.68** | 22.2 | 448 ms | 814 MB |
+| **1.7B Base (CUDA BF16)** | **0.72** | **0.74** | 17.3 | 590 ms | 761 MB |
+| **1.7B CustomVoice (CUDA BF16)** | **0.72** | **0.75** | 17.3 | 585 ms | 761 MB |
+| **1.7B VoiceDesign (CUDA BF16)** | **0.72** | **0.75** | 17.3 | 585 ms | 761 MB |
+| 1.7B CustomVoice (CPU F32) | 5.39 | 6.48 | 2.1 | — | 9.1 GB |
 
 RTF (real-time factor) = wall-clock / audio duration. **< 1.0 is faster than real-time.**
 TTFA = time to first audio chunk via streaming.

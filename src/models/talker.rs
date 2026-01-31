@@ -718,19 +718,11 @@ impl TalkerModel {
         kv_caches: &mut [KVCache],
         offset: usize,
     ) -> Result<(Tensor, Tensor)> {
-        // Create causal mask for single token (attends to all previous positions)
-        let mask = self.create_causal_mask(1, offset)?;
-
-        // Run through all layers with KV cache
+        // Single token attending to all previous positions via KV cache —
+        // no masking needed (causal mask for seq_len=1 is all zeros).
         let mut hidden = input_embed.clone();
         for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(
-                &hidden,
-                &self.rope,
-                Some(&mask),
-                Some(&mut kv_caches[i]),
-                offset,
-            )?;
+            hidden = layer.forward(&hidden, &self.rope, None, Some(&mut kv_caches[i]), offset)?;
         }
 
         // Final norm

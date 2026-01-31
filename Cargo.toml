@@ -1,6 +1,6 @@
 [package]
 name = "qwen3-tts"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Pure Rust inference for Qwen3-TTS"
 license = "MIT"
@@ -25,6 +25,7 @@ accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transfor
 mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 flash-attn = ["cuda", "dep:candle-flash-attn"]
+profiling = ["dep:tracing-chrome"]
 
 [dependencies]
 # Candle ML framework
@@ -64,6 +65,9 @@ indicatif = { version = "0.18", optional = true }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
 audioadapter-buffers = "2.0.0"
 
+# Profiling (optional)
+tracing-chrome = { version = "0.7", optional = true }
+
 [dev-dependencies]
 criterion = "0.8"
 approx = "0.5"
@@ -97,3 +101,8 @@ required-features = ["cli"]
 lto = true
 codegen-units = 1
 opt-level = 3
+
+[profile.profiling]
+inherits = "release"
+debug = true
+lto = false

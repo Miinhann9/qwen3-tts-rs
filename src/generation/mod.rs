@@ -14,4 +14,7 @@ pub use sampling::{
     apply_repetition_penalty, greedy_sample, sample, GenerationConfig, SamplingContext,
 };
 
-pub use tts::apply_token_suppression;
+pub use tts::{
+    apply_token_suppression, apply_token_suppression_with_mask, build_suppression_mask,
+    SuppressionMask,
+};
