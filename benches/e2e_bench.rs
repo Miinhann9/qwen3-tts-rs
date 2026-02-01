@@ -16,7 +16,7 @@ use anyhow::Result;
 use clap::Parser;
 use qwen3_tts::{
     device_info, models::talker::Speaker, parse_device, AudioBuffer, Qwen3TTS, SynthesisOptions,
-    SAMPLES_PER_FRAME,
+    SynthesisTiming, SAMPLES_PER_FRAME,
 };
 use serde::Serialize;
 use std::time::Instant;
@@ -53,9 +53,32 @@ struct Args {
     /// Also measure time-to-first-audio via streaming
     #[arg(long)]
     streaming: bool,
+
+    /// Only run these labels (comma-separated, e.g. "short,medium")
+    #[arg(long, value_delimiter = ',')]
+    labels: Vec<String>,
 }
 
 // ── Result types ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+struct StageBreakdown {
+    prefill_ms: f64,
+    generation_ms: f64,
+    generation_frames: usize,
+    decode_ms: f64,
+}
+
+impl From<&SynthesisTiming> for StageBreakdown {
+    fn from(t: &SynthesisTiming) -> Self {
+        Self {
+            prefill_ms: t.prefill_ms,
+            generation_ms: t.generation_ms,
+            generation_frames: t.generation_frames,
+            decode_ms: t.decode_ms,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct BenchmarkResult {
@@ -63,6 +86,12 @@ struct BenchmarkResult {
     text: String,
     word_count: usize,
     wall_clock_ms: f64,
+    /// Standard deviation of wall-clock times across iterations.
+    wall_clock_stddev_ms: f64,
+    /// Minimum wall-clock time across iterations.
+    wall_clock_min_ms: f64,
+    /// Maximum wall-clock time across iterations.
+    wall_clock_max_ms: f64,
     audio_duration_secs: f64,
     /// Wall-clock / audio duration. Lower = faster. < 1.0 = faster than real-time.
     rtf: f64,
@@ -73,6 +102,8 @@ struct BenchmarkResult {
     frames_generated: usize,
     /// Resident set size on Linux, None elsewhere.
     peak_memory_mb: Option<f64>,
+    /// Per-stage timing breakdown (averaged across iterations).
+    stages: Option<StageBreakdown>,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,14 +173,38 @@ fn peak_memory_mb() -> Option<f64> {
     }
 }
 
+// ── Environment checks ──────────────────────────────────────────────────
+
+fn warn_cpu_governor() {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(governor) =
+            std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+        {
+            let governor = governor.trim();
+            if governor != "performance" {
+                eprintln!(
+                    "WARNING: CPU governor is '{}', not 'performance'. \
+                     Results may be noisy. Fix with:\n  \
+                     sudo cpupower frequency-set -g performance\n",
+                    governor,
+                );
+            }
+        }
+    }
+}
+
 // ── Benchmark runner ─────────────────────────────────────────────────────
 
-fn run_single(
-    model: &Qwen3TTS,
-    text: &str,
-    seed: u64,
-    streaming: bool,
-) -> Result<(AudioBuffer, usize, f64, Option<f64>)> {
+struct SingleRunResult {
+    audio: AudioBuffer,
+    frames: usize,
+    wall_ms: f64,
+    ttfa_ms: Option<f64>,
+    timing: Option<SynthesisTiming>,
+}
+
+fn run_single(model: &Qwen3TTS, text: &str, seed: u64, streaming: bool) -> Result<SingleRunResult> {
     let options = SynthesisOptions {
         seed: Some(seed),
         ..Default::default()
@@ -179,13 +234,30 @@ fn run_single(
 
         let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
         let audio = AudioBuffer::new(all_samples, 24000);
-        Ok((audio, total_frames, wall_ms, ttfa))
+        Ok(SingleRunResult {
+            audio,
+            frames: total_frames,
+            wall_ms,
+            ttfa_ms: ttfa,
+            timing: None,
+        })
     } else {
         let start = Instant::now();
-        let audio = model.synthesize(text, Some(options))?;
+        let (audio, timing) = model.synthesize_with_timing(
+            text,
+            Speaker::Ryan,
+            qwen3_tts::models::talker::Language::English,
+            Some(options),
+        )?;
         let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
         let frames = audio.len() / SAMPLES_PER_FRAME;
-        Ok((audio, frames, wall_ms, None))
+        Ok(SingleRunResult {
+            audio,
+            frames,
+            wall_ms,
+            ttfa_ms: None,
+            timing: Some(timing),
+        })
     }
 }
 
@@ -205,24 +277,58 @@ fn run_benchmark(
     // Timed runs
     let mut wall_times = Vec::with_capacity(args.iterations);
     let mut ttfa_times: Vec<f64> = Vec::new();
+    let mut timings: Vec<SynthesisTiming> = Vec::new();
     let mut last_audio_dur = 0.0f64;
     let mut last_frames = 0usize;
 
     for _ in 0..args.iterations {
-        let (audio, frames, wall_ms, ttfa) = run_single(model, text, args.seed, args.streaming)?;
-        wall_times.push(wall_ms);
-        if let Some(t) = ttfa {
+        // Sync device before each timed run to drain any stale GPU work
+        qwen3_tts::sync_device(model.device())?;
+
+        let run = run_single(model, text, args.seed, args.streaming)?;
+        wall_times.push(run.wall_ms);
+        if let Some(t) = run.ttfa_ms {
             ttfa_times.push(t);
         }
-        last_audio_dur = audio.len() as f64 / audio.sample_rate as f64;
-        last_frames = frames;
+        if let Some(t) = run.timing {
+            timings.push(t);
+        }
+        last_audio_dur = run.audio.len() as f64 / run.audio.sample_rate as f64;
+        last_frames = run.frames;
     }
 
-    let avg_wall_ms = wall_times.iter().sum::<f64>() / wall_times.len() as f64;
+    let n = wall_times.len() as f64;
+    let avg_wall_ms = wall_times.iter().sum::<f64>() / n;
+    let wall_min = wall_times.iter().cloned().fold(f64::INFINITY, f64::min);
+    let wall_max = wall_times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let wall_stddev = if wall_times.len() > 1 {
+        let variance = wall_times
+            .iter()
+            .map(|t| (t - avg_wall_ms).powi(2))
+            .sum::<f64>()
+            / (n - 1.0);
+        variance.sqrt()
+    } else {
+        0.0
+    };
+
     let avg_ttfa = if ttfa_times.is_empty() {
         None
     } else {
         Some(ttfa_times.iter().sum::<f64>() / ttfa_times.len() as f64)
+    };
+
+    // Average stage timings across all iterations
+    let avg_stages = if timings.is_empty() {
+        None
+    } else {
+        let tn = timings.len() as f64;
+        Some(StageBreakdown {
+            prefill_ms: timings.iter().map(|t| t.prefill_ms).sum::<f64>() / tn,
+            generation_ms: timings.iter().map(|t| t.generation_ms).sum::<f64>() / tn,
+            generation_frames: timings.last().map(|t| t.generation_frames).unwrap_or(0),
+            decode_ms: timings.iter().map(|t| t.decode_ms).sum::<f64>() / tn,
+        })
     };
 
     let wall_secs = avg_wall_ms / 1000.0;
@@ -242,46 +348,100 @@ fn run_benchmark(
         text: text.to_string(),
         word_count,
         wall_clock_ms: avg_wall_ms,
+        wall_clock_stddev_ms: wall_stddev,
+        wall_clock_min_ms: wall_min,
+        wall_clock_max_ms: wall_max,
         audio_duration_secs: last_audio_dur,
         rtf,
         ttfa_ms: avg_ttfa,
         tokens_per_sec,
         frames_generated: last_frames,
         peak_memory_mb: peak_memory_mb(),
+        stages: avg_stages,
     })
 }
 
 // ── Table formatting ─────────────────────────────────────────────────────
 
 fn print_table(results: &[BenchmarkResult]) {
+    let has_stages = results.iter().any(|r| r.stages.is_some());
+
     println!();
-    println!(
-        "{:<8} {:>6} {:>10} {:>10} {:>8} {:>10} {:>8} {:>8}",
-        "Label", "Words", "Wall (ms)", "Audio (s)", "RTF", "TTFA (ms)", "Tok/s", "Mem (MB)"
-    );
-    println!("{}", "-".repeat(78));
+    if has_stages {
+        println!(
+            "{:<8} {:>6} {:>10} {:>10} {:>8} {:>10} {:>8} {:>10} {:>10} {:>10} {:>10}",
+            "Label",
+            "Words",
+            "Wall (ms)",
+            "±stddev",
+            "Audio (s)",
+            "RTF",
+            "Tok/s",
+            "Mem (MB)",
+            "Prefill",
+            "Generate",
+            "Decode"
+        );
+        println!("{}", "-".repeat(116));
+    } else {
+        println!(
+            "{:<8} {:>6} {:>10} {:>10} {:>8} {:>10} {:>8} {:>8}",
+            "Label", "Words", "Wall (ms)", "Audio (s)", "RTF", "TTFA (ms)", "Tok/s", "Mem (MB)"
+        );
+        println!("{}", "-".repeat(78));
+    }
 
     for r in results {
-        let ttfa = r
-            .ttfa_ms
-            .map(|t| format!("{t:.1}"))
-            .unwrap_or_else(|| "-".into());
         let mem = r
             .peak_memory_mb
             .map(|m| format!("{m:.0}"))
             .unwrap_or_else(|| "-".into());
 
-        println!(
-            "{:<8} {:>6} {:>10.1} {:>10.2} {:>8.3} {:>10} {:>8.1} {:>8}",
-            r.label,
-            r.word_count,
-            r.wall_clock_ms,
-            r.audio_duration_secs,
-            r.rtf,
-            ttfa,
-            r.tokens_per_sec,
-            mem,
-        );
+        if has_stages {
+            let (prefill, gen, decode) = if let Some(ref s) = r.stages {
+                let total = s.prefill_ms + s.generation_ms + s.decode_ms;
+                let pct = |v: f64| {
+                    if total > 0.0 {
+                        format!("{v:.0}ms ({:.0}%)", v / total * 100.0)
+                    } else {
+                        format!("{v:.0}ms")
+                    }
+                };
+                (pct(s.prefill_ms), pct(s.generation_ms), pct(s.decode_ms))
+            } else {
+                ("-".into(), "-".into(), "-".into())
+            };
+            println!(
+                "{:<8} {:>6} {:>10.1} {:>10.1} {:>10.2} {:>8.3} {:>10.1} {:>8} {:>10} {:>10} {:>10}",
+                r.label,
+                r.word_count,
+                r.wall_clock_ms,
+                r.wall_clock_stddev_ms,
+                r.audio_duration_secs,
+                r.rtf,
+                r.tokens_per_sec,
+                mem,
+                prefill,
+                gen,
+                decode,
+            );
+        } else {
+            let ttfa = r
+                .ttfa_ms
+                .map(|t| format!("{t:.1}"))
+                .unwrap_or_else(|| "-".into());
+            println!(
+                "{:<8} {:>6} {:>10.1} {:>10.2} {:>8.3} {:>10} {:>8.1} {:>8}",
+                r.label,
+                r.word_count,
+                r.wall_clock_ms,
+                r.audio_duration_secs,
+                r.rtf,
+                ttfa,
+                r.tokens_per_sec,
+                mem,
+            );
+        }
     }
     println!();
 }
@@ -289,7 +449,11 @@ fn print_table(results: &[BenchmarkResult]) {
 // ── Main ─────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // Use chrome tracing when `profiling` feature is active, otherwise plain fmt.
+    let _profiling_guard = qwen3_tts::profiling::init();
+    if _profiling_guard.is_none() {
+        tracing_subscriber::fmt::init();
+    }
     let args = Args::parse();
 
     let device = parse_device(&args.device)?;
@@ -304,11 +468,22 @@ fn main() -> Result<()> {
     }
     println!();
 
+    // Warn if CPU governor isn't set to performance (Linux only)
+    warn_cpu_governor();
+
     println!("Loading model...");
     let model = Qwen3TTS::from_pretrained(&args.model_dir, device)?;
-    println!("Model loaded.\n");
+    println!("Model loaded.");
 
-    let corpus = test_corpus();
+    // GPU warmup: run a small tensor op to ensure CUDA context, JIT kernels,
+    // and memory pools are fully initialized before we start timing.
+    qwen3_tts::sync_device(model.device())?;
+    println!();
+
+    let corpus: Vec<_> = test_corpus()
+        .into_iter()
+        .filter(|(label, _)| args.labels.is_empty() || args.labels.iter().any(|l| l == label))
+        .collect();
     let mut results = Vec::with_capacity(corpus.len());
 
     for (label, text) in &corpus {
@@ -316,8 +491,11 @@ fn main() -> Result<()> {
         std::io::Write::flush(&mut std::io::stdout())?;
         let result = run_benchmark(&model, label, text, &args)?;
         println!(
-            " RTF={:.3} ({:.0}ms, {:.2}s audio)",
-            result.rtf, result.wall_clock_ms, result.audio_duration_secs
+            " RTF={:.3} ({:.0}ms ±{:.0}, {:.2}s audio)",
+            result.rtf,
+            result.wall_clock_ms,
+            result.wall_clock_stddev_ms,
+            result.audio_duration_secs,
         );
         results.push(result);
     }

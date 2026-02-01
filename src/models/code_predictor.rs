@@ -267,12 +267,16 @@ impl CodePredictor {
     /// * `semantic_embed` - Embedding of semantic token, shape `[batch, 1, hidden]`
     ///
     /// # Returns
-    /// Vector of 15 acoustic token IDs.
+    /// Tuple of (acoustic codes as `Vec<u32>`, codes as GPU tensor \[num_acoustic\]).
+    /// The tensor is returned to allow GPU-side embedding lookup without re-uploading.
     pub fn generate_acoustic_codes(
         &self,
         talker_hidden: &Tensor,
         semantic_embed: &Tensor,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<(Vec<u32>, Tensor)> {
+        #[cfg(feature = "profiling")]
+        let _span = tracing::info_span!("code_predictor_inner").entered();
+
         let device = talker_hidden.device();
         let num_acoustic = self.config.num_code_groups - 1; // 15 acoustic codes
 
@@ -301,20 +305,25 @@ impl CodePredictor {
         hidden = self.norm.forward(&hidden)?;
 
         // Step 2: Predict first acoustic code from last position
+        // Keep codes as GPU tensors to avoid per-step GPU→CPU syncs.
+        // Pre-allocate a single [num_acoustic] tensor and write each code into it
+        // to avoid Tensor::cat overhead on many small tensors.
         let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
         let logits = self.lm_heads[0].forward(&last_hidden)?;
-        let code: u32 = logits.argmax(D::Minus1)?.flatten_all()?.to_vec1::<u32>()?[0];
+        let first_code = logits.argmax(D::Minus1)?.flatten_all()?; // [1] tensor on GPU
 
-        let mut codes = Vec::with_capacity(num_acoustic);
-        codes.push(code);
+        let mut all_codes = Tensor::zeros(num_acoustic, candle_core::DType::U32, device)?;
+        let range = 0..1;
+        all_codes = all_codes.slice_assign(&[range], &first_code)?;
+
+        // Also keep a reference to the latest code for embedding lookup
+        let mut prev_code = first_code;
 
         // Step 3: Autoregressively generate remaining 14 codes
         let mut offset = seq_len;
         for group_idx in 1..num_acoustic {
-            // Embed previous code using the previous group's embedding
-            let prev_code = codes[group_idx - 1];
-            let code_tensor = Tensor::new(&[prev_code], device)?;
-            let code_embed = self.codec_embeddings[group_idx - 1].forward(&code_tensor)?;
+            // Embed previous code using the previous group's embedding (stays on GPU)
+            let code_embed = self.codec_embeddings[group_idx - 1].forward(&prev_code)?;
             let code_embed = code_embed.unsqueeze(0)?; // [1, 1, codec_embed_dim]
 
             // Apply projection if needed
@@ -324,26 +333,28 @@ impl CodePredictor {
                 code_embed
             };
 
-            // Create mask for single token attending to all previous positions
-            let total_len = offset + 1;
-            let mask_data: Vec<f32> = (0..total_len).map(|_| 0.0f32).collect();
-            let mask = Tensor::from_vec(mask_data, (1, 1, 1, total_len), device)?;
-
-            // Run through layers with KV cache
+            // Single token attending to all previous positions via KV cache —
+            // no masking needed (all-zeros mask is a no-op).
             let mut h = code_embed;
             for (i, layer) in self.layers.iter().enumerate() {
-                h = layer.forward(&h, &self.rope, Some(&mask), Some(&mut kv_caches[i]), offset)?;
+                h = layer.forward(&h, &self.rope, None, Some(&mut kv_caches[i]), offset)?;
             }
             h = self.norm.forward(&h)?;
 
-            // Predict next code
+            // Predict next code (stays on GPU)
             let logits = self.lm_heads[group_idx].forward(&h)?;
-            let next_code: u32 = logits.argmax(D::Minus1)?.flatten_all()?.to_vec1::<u32>()?[0];
-            codes.push(next_code);
+            let next_code = logits.argmax(D::Minus1)?.flatten_all()?; // [1] tensor on GPU
+            let range = group_idx..group_idx + 1;
+            all_codes = all_codes.slice_assign(&[range], &next_code)?;
+            prev_code = next_code;
             offset += 1;
         }
 
-        Ok(codes)
+        // Single GPU→CPU transfer for all codes
+        tracing::trace!(target: "gpu_sync", "to_vec1 in code_predictor all acoustic codes (batched)");
+        let codes: Vec<u32> = all_codes.to_vec1()?;
+
+        Ok((codes, all_codes))
     }
 
     fn create_causal_mask(&self, seq_len: usize, device: &candle_core::Device) -> Result<Tensor> {
@@ -419,6 +430,34 @@ impl CodePredictor {
                 let embed = self.get_acoustic_embedding(code, i + 1, device)?;
                 acc.add(&embed).map_err(Into::into)
             })
+    }
+
+    /// Get sum of all acoustic code embeddings from a GPU tensor.
+    ///
+    /// Like `get_acoustic_embeddings_sum` but takes codes as a \[num_acoustic\] tensor
+    /// already on device, avoiding 15 small CPU→GPU transfers.
+    pub fn get_acoustic_embeddings_sum_from_tensor(
+        &self,
+        acoustic_codes: &Tensor,
+    ) -> Result<Tensor> {
+        let n = acoustic_codes.dim(0)?;
+        if n != self.codec_embeddings.len() {
+            anyhow::bail!(
+                "Expected {} acoustic codes, got {}",
+                self.codec_embeddings.len(),
+                n
+            );
+        }
+
+        let first_code = acoustic_codes.narrow(0, 0, 1)?;
+        let first = self.codec_embeddings[0]
+            .forward(&first_code)?
+            .unsqueeze(0)?;
+        (1..n).try_fold(first, |acc, i| {
+            let code = acoustic_codes.narrow(0, i, 1)?;
+            let embed = self.codec_embeddings[i].forward(&code)?.unsqueeze(0)?;
+            acc.add(&embed).map_err(Into::into)
+        })
     }
 }
 

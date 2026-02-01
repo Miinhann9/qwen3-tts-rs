@@ -178,103 +178,120 @@ pub fn sample(
 }
 
 /// Apply top-k filtering: keep only the top k logits, set rest to -inf
+///
+/// Dispatches between CPU-native Rust sort and GPU tensor sort.
 fn top_k_filter(logits: &Tensor, k: usize) -> Result<Tensor> {
+    #[cfg(feature = "profiling")]
+    let _span = tracing::info_span!("top_k").entered();
     let (batch, vocab) = logits.dims2()?;
     let k = k.min(vocab);
 
-    let mut result_data = Vec::with_capacity(batch * vocab);
-
-    for b in 0..batch {
-        let row: Vec<f32> = logits.i(b)?.to_vec1()?;
-
-        // Find the k-th largest value
-        let mut sorted = row.clone();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let threshold = sorted.get(k - 1).copied().unwrap_or(f32::NEG_INFINITY);
-
-        // Mask values below threshold
-        let filtered: Vec<f32> = row
-            .iter()
-            .map(|&v| if v >= threshold { v } else { f32::NEG_INFINITY })
-            .collect();
-        result_data.extend(filtered);
+    if logits.device().is_cpu() {
+        // CPU path: native Rust partial sort is faster than candle sort_last_dim
+        let mut result_data = Vec::with_capacity(batch * vocab);
+        for b in 0..batch {
+            let row: Vec<f32> = logits.i(b)?.to_vec1()?;
+            let mut sorted = row.clone();
+            sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let threshold = sorted[k - 1];
+            result_data.extend(
+                row.iter()
+                    .map(|&v| if v >= threshold { v } else { f32::NEG_INFINITY }),
+            );
+        }
+        Ok(Tensor::new(result_data.as_slice(), logits.device())?.reshape((batch, vocab))?)
+    } else {
+        // GPU path: sort on device to avoid GPU→CPU transfer
+        let (sorted, _) = logits.sort_last_dim(false)?;
+        let threshold = sorted.narrow(1, k - 1, 1)?;
+        let mask = logits.ge(&threshold.broadcast_as(logits.shape())?)?;
+        let neg_inf =
+            Tensor::new(&[f32::NEG_INFINITY], logits.device())?.broadcast_as(logits.shape())?;
+        Ok(mask.where_cond(logits, &neg_inf)?)
     }
-
-    Ok(Tensor::new(result_data.as_slice(), logits.device())?.reshape((batch, vocab))?)
 }
 
 /// Apply top-p (nucleus) filtering: keep smallest set of tokens whose cumulative probability >= top_p
+///
+/// Dispatches between CPU-native Rust sort and GPU tensor ops.
 fn top_p_filter(logits: &Tensor, p: f64) -> Result<Tensor> {
-    let (batch, vocab) = logits.dims2()?;
-    let mut result_data = Vec::with_capacity(batch * vocab);
+    #[cfg(feature = "profiling")]
+    let _span = tracing::info_span!("top_p").entered();
 
-    for b in 0..batch {
-        let row: Vec<f32> = logits.i(b)?.to_vec1()?;
+    if logits.device().is_cpu() {
+        // CPU path: native Rust sort + cumsum (avoids candle sort_last_dim overhead)
+        let (batch, vocab) = logits.dims2()?;
+        let mut result_data = Vec::with_capacity(batch * vocab);
 
-        // Sort indices by logit value descending
-        let mut indices: Vec<usize> = (0..vocab).collect();
-        indices.sort_by(|&a, &b| {
-            row[b]
-                .partial_cmp(&row[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        for b in 0..batch {
+            let row: Vec<f32> = logits.i(b)?.to_vec1()?;
+            let mut indices: Vec<usize> = (0..vocab).collect();
+            indices.sort_unstable_by(|&a, &b| {
+                row[b]
+                    .partial_cmp(&row[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
-        // Compute softmax over sorted logits
-        let max_val = row[indices[0]];
-        let mut exp_sorted: Vec<f32> = indices.iter().map(|&i| (row[i] - max_val).exp()).collect();
-        let sum: f32 = exp_sorted.iter().sum();
-        for v in &mut exp_sorted {
-            *v /= sum;
-        }
-
-        // Find cutoff: cumulative probability exceeds top_p
-        let mut cumsum = 0.0f32;
-        let mut cutoff_idx = vocab; // keep all by default
-        for (i, &prob) in exp_sorted.iter().enumerate() {
-            cumsum += prob;
-            if cumsum > p as f32 {
-                cutoff_idx = i + 1; // include the token that pushes us over
-                break;
+            // Softmax over sorted values
+            let max_val = row[indices[0]];
+            let mut exp_sorted: Vec<f32> =
+                indices.iter().map(|&i| (row[i] - max_val).exp()).collect();
+            let sum: f32 = exp_sorted.iter().sum();
+            for v in &mut exp_sorted {
+                *v /= sum;
             }
+
+            // Cumulative probability cutoff
+            let mut cumsum = 0.0f32;
+            let mut cutoff_idx = vocab;
+            for (i, &prob) in exp_sorted.iter().enumerate() {
+                cumsum += prob;
+                if cumsum > p as f32 {
+                    cutoff_idx = i + 1;
+                    break;
+                }
+            }
+
+            let mut filtered = vec![f32::NEG_INFINITY; vocab];
+            for &idx in &indices[..cutoff_idx] {
+                filtered[idx] = row[idx];
+            }
+            result_data.extend(filtered);
         }
 
-        // Mask tokens beyond the cutoff
-        let mut filtered = vec![f32::NEG_INFINITY; vocab];
-        for &idx in &indices[..cutoff_idx] {
-            filtered[idx] = row[idx];
-        }
-        result_data.extend(filtered);
+        Ok(Tensor::new(result_data.as_slice(), logits.device())?.reshape((batch, vocab))?)
+    } else {
+        // GPU path: sort + cumsum on device
+        let (sorted_logits, _) = logits.sort_last_dim(false)?;
+        let sorted_probs = candle_nn::ops::softmax_last_dim(&sorted_logits)?;
+        let cumulative_probs = sorted_probs.cumsum(1)?;
+
+        let shifted = cumulative_probs.narrow(1, 0, cumulative_probs.dim(1)? - 1)?;
+        let zeros = Tensor::zeros((logits.dim(0)?, 1), DType::F32, logits.device())?;
+        let shifted_cumsum = Tensor::cat(&[&zeros, &shifted], 1)?;
+
+        let threshold_val =
+            Tensor::new(&[p as f32], logits.device())?.broadcast_as(shifted_cumsum.shape())?;
+        let remove_mask = shifted_cumsum.ge(&threshold_val)?;
+
+        let pos_inf =
+            Tensor::new(&[f32::INFINITY], logits.device())?.broadcast_as(sorted_logits.shape())?;
+        let kept_logits = remove_mask.where_cond(&pos_inf, &sorted_logits)?;
+        let min_kept = kept_logits.min(D::Minus1)?.unsqueeze(1)?;
+
+        let keep_original = logits.ge(&min_kept.broadcast_as(logits.shape())?)?;
+        let neg_inf =
+            Tensor::new(&[f32::NEG_INFINITY], logits.device())?.broadcast_as(logits.shape())?;
+        Ok(keep_original.where_cond(logits, &neg_inf)?)
     }
-
-    Ok(Tensor::new(result_data.as_slice(), logits.device())?.reshape((batch, vocab))?)
-}
-
-/// Compute cumulative sum along last dimension
-fn cumulative_sum(x: &Tensor) -> Result<Tensor> {
-    let (batch, len) = x.dims2()?;
-    let mut results = Vec::with_capacity(batch);
-
-    for b in 0..batch {
-        let row: Vec<f32> = x.i(b)?.to_vec1()?;
-        let mut cumsum = Vec::with_capacity(len);
-        let mut sum = 0.0f32;
-        for v in row {
-            sum += v;
-            cumsum.push(sum);
-        }
-        results.push(cumsum);
-    }
-
-    let flat: Vec<f32> = results.into_iter().flatten().collect();
-    Ok(Tensor::new(flat.as_slice(), x.device())?.reshape((batch, len))?)
 }
 
 /// Sample from probability distribution using multinomial sampling
 fn multinomial_sample(probs: &Tensor, ctx: &mut SamplingContext) -> Result<Tensor> {
     let (batch, vocab) = probs.dims2()?;
 
-    // Use cumulative distribution for sampling
-    let cumsum = cumulative_sum(probs)?;
+    // Cumulative distribution for sampling
+    let cumsum = probs.cumsum(1)?;
 
     // Generate uniform random values
     let uniform: Vec<f32> = (0..batch).map(|_| ctx.rand_f32()).collect();
@@ -302,6 +319,9 @@ fn multinomial_sample(probs: &Tensor, ctx: &mut SamplingContext) -> Result<Tenso
 }
 
 /// Apply repetition penalty to logits
+///
+/// Uses on-device tensor ops to avoid transferring full logit tensors to CPU.
+/// Only the input_ids (small) are transferred for building the penalty mask.
 pub fn apply_repetition_penalty(
     logits: &Tensor,
     input_ids: &Tensor,
@@ -311,26 +331,39 @@ pub fn apply_repetition_penalty(
         return Ok(logits.clone());
     }
 
-    let (batch, vocab) = logits.dims2()?;
-    let input_ids_vec: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
-    let mut logits_vec: Vec<f32> = logits.flatten_all()?.to_vec1()?;
+    let (_batch, vocab) = logits.dims2()?;
+    let penalty_f32 = penalty as f32;
 
-    // Apply penalty to previously generated tokens
-    for token_id in input_ids_vec {
-        let idx = token_id as usize;
+    // Build a one-hot-style mask on device for penalized token positions.
+    // Only input_ids (typically small) are transferred to CPU.
+    let input_ids_vec: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+    let mut mask_data = vec![0.0f32; vocab];
+    for &tid in &input_ids_vec {
+        let idx = tid as usize;
         if idx < vocab {
-            for b in 0..batch {
-                let i = b * vocab + idx;
-                if logits_vec[i] > 0.0 {
-                    logits_vec[i] /= penalty as f32;
-                } else {
-                    logits_vec[i] *= penalty as f32;
-                }
-            }
+            mask_data[idx] = 1.0;
         }
     }
+    let penalty_mask = Tensor::new(mask_data.as_slice(), logits.device())?
+        .unsqueeze(0)?
+        .broadcast_as(logits.shape())?; // [batch, vocab]
 
-    Ok(Tensor::new(logits_vec.as_slice(), logits.device())?.reshape((batch, vocab))?)
+    // For positive logits: penalized = logit / penalty, so factor = 1/penalty
+    // For negative logits: penalized = logit * penalty, so factor = penalty
+    // Non-penalized positions: factor = 1.0
+    let is_positive = logits.gt(&Tensor::zeros(logits.shape(), DType::F32, logits.device())?)?;
+    let pos_factor =
+        Tensor::new(&[1.0 / penalty_f32], logits.device())?.broadcast_as(logits.shape())?;
+    let neg_factor = Tensor::new(&[penalty_f32], logits.device())?.broadcast_as(logits.shape())?;
+    let penalty_factor = is_positive.where_cond(&pos_factor, &neg_factor)?;
+
+    // Where mask is 1.0, apply penalty factor; where 0.0, keep factor as 1.0
+    let ones = Tensor::ones(logits.shape(), DType::F32, logits.device())?;
+    let is_penalized =
+        penalty_mask.gt(&Tensor::zeros(logits.shape(), DType::F32, logits.device())?)?;
+    let final_factor = is_penalized.where_cond(&penalty_factor, &ones)?;
+
+    Ok((logits * final_factor)?)
 }
 
 /// Greedy sampling (argmax)
@@ -373,10 +406,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_sum() {
+    fn test_cumsum() {
         let device = Device::Cpu;
         let x = Tensor::new(&[[0.1f32, 0.2, 0.3, 0.4]], &device).unwrap();
-        let cumsum = cumulative_sum(&x).unwrap();
+        let cumsum = x.cumsum(1).unwrap();
         let result: Vec<f32> = cumsum.flatten_all().unwrap().to_vec1().unwrap();
         assert!((result[0] - 0.1).abs() < 1e-5);
         assert!((result[1] - 0.3).abs() < 1e-5);
@@ -385,14 +418,14 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_sum_batch() {
+    fn test_cumsum_batch() {
         let device = Device::Cpu;
         let x = Tensor::new(
             &[[0.25f32, 0.25, 0.25, 0.25], [0.1, 0.2, 0.3, 0.4]],
             &device,
         )
         .unwrap();
-        let cumsum = cumulative_sum(&x).unwrap();
+        let cumsum = x.cumsum(1).unwrap();
         let result: Vec<f32> = cumsum.flatten_all().unwrap().to_vec1().unwrap();
         // First row
         assert!((result[0] - 0.25).abs() < 1e-5);
@@ -637,5 +670,69 @@ mod tests {
             results1, results2,
             "Seeded sampling should be deterministic"
         );
+    }
+
+    #[test]
+    fn test_top_k_filter_keeps_top_values() {
+        let device = Device::Cpu;
+        let logits = Tensor::new(&[[1.0f32, 5.0, 3.0, 2.0, 4.0]], &device).unwrap();
+        let filtered = top_k_filter(&logits, 3).unwrap();
+        let vals: Vec<f32> = filtered.flatten_all().unwrap().to_vec1().unwrap();
+        // Top-3 are indices 1(5.0), 4(4.0), 2(3.0); rest should be -inf
+        assert!((vals[1] - 5.0).abs() < 1e-5);
+        assert!((vals[4] - 4.0).abs() < 1e-5);
+        assert!((vals[2] - 3.0).abs() < 1e-5);
+        assert!(vals[0].is_infinite() && vals[0] < 0.0);
+        assert!(vals[3].is_infinite() && vals[3] < 0.0);
+    }
+
+    #[test]
+    fn test_top_k_filter_k_larger_than_vocab() {
+        let device = Device::Cpu;
+        let logits = Tensor::new(&[[1.0f32, 2.0, 3.0]], &device).unwrap();
+        let filtered = top_k_filter(&logits, 100).unwrap();
+        let vals: Vec<f32> = filtered.flatten_all().unwrap().to_vec1().unwrap();
+        // All values should be preserved
+        assert!((vals[0] - 1.0).abs() < 1e-5);
+        assert!((vals[1] - 2.0).abs() < 1e-5);
+        assert!((vals[2] - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_top_p_filter_nucleus() {
+        let device = Device::Cpu;
+        // One dominant logit should survive top-p filtering
+        let logits = Tensor::new(&[[10.0f32, 0.0, 0.0, 0.0]], &device).unwrap();
+        let filtered = top_p_filter(&logits, 0.9).unwrap();
+        let vals: Vec<f32> = filtered.flatten_all().unwrap().to_vec1().unwrap();
+        // The dominant token should be kept
+        assert!((vals[0] - 10.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_top_p_filter_uniform_keeps_enough() {
+        let device = Device::Cpu;
+        // Uniform logits — top-p=0.5 should keep roughly half
+        let logits = Tensor::new(&[[1.0f32, 1.0, 1.0, 1.0]], &device).unwrap();
+        let filtered = top_p_filter(&logits, 0.5).unwrap();
+        let vals: Vec<f32> = filtered.flatten_all().unwrap().to_vec1().unwrap();
+        let kept = vals.iter().filter(|v| !v.is_infinite()).count();
+        // Should keep at least 2 and not all 4
+        assert!(kept >= 2);
+        assert!(kept <= 4);
+    }
+
+    #[test]
+    fn test_apply_repetition_penalty_multiple_tokens() {
+        let device = Device::Cpu;
+        let logits = Tensor::new(&[[2.0f32, 3.0, 4.0, 5.0]], &device).unwrap();
+        let input_ids = Tensor::new(&[0u32, 2], &device).unwrap();
+        let penalty = 2.0;
+        let result = apply_repetition_penalty(&logits, &input_ids, penalty).unwrap();
+        let vals: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
+        assert!((vals[0] - 1.0).abs() < 1e-5); // 2.0 / 2.0
+        assert!((vals[1] - 3.0).abs() < 1e-5); // unchanged
+        assert!((vals[2] - 2.0).abs() < 1e-5); // 4.0 / 2.0
+        assert!((vals[3] - 5.0).abs() < 1e-5); // unchanged
     }
 }

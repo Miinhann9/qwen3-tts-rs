@@ -25,3 +25,10 @@ __pycache__/
 # UV lock file (large, can be regenerated)
 uv.lock
 /models/
+bench-*.json
+trace.json
+perf.data
+perf.data.old
+nsys_report.*
+/flamegraph.svg
+!/docs/flamegraph.svg

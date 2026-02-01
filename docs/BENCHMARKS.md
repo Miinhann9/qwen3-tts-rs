@@ -2,8 +2,9 @@
 
 Performance measurements for `qwen3-tts-rs` inference across CPU and GPU.
 
-All results use the **1.7B CustomVoice** model with default generation parameters
+All results use default generation parameters
 (temperature=0.9, top_k=50, top_p=0.9, repetition_penalty=1.05, seed=42).
+2 warmup runs, 3 timed iterations, streaming mode enabled for TTFA measurement.
 
 ## Test Hardware
 
@@ -28,15 +29,43 @@ All results use the **1.7B CustomVoice** model with default generation parameter
 
 Real-time factor (RTF) = wall-clock time / audio duration. **Lower is better; < 1.0 means faster than real-time.**
 
-Each cell shows the average of 3 timed iterations after 2 warmup runs, executed in isolation (no concurrent workloads).
+Each cell shows the average of 3 timed iterations after 2 warmup runs, executed in isolation (no concurrent GPU workloads).
 
-### CUDA (BF16)
+### 0.6B Base — CUDA (BF16)
 
-| Text | Words | Frames | Wall Clock | Audio Duration | RTF | TTFA | Tok/s | Memory |
-|------|-------|--------|------------|----------------|-----|------|-------|--------|
-| Short | 13 | 46 | 2.86 sec | 3.68 sec | **0.78** | 627 ms | 16.1 | 761 MB |
-| Medium | 53 | 425 | 26.62 sec | 34.00 sec | **0.78** | 630 ms | 16.0 | 765 MB |
-| Long | 115 | 762 | 49.20 sec | 60.96 sec | **0.81** | 632 ms | 15.5 | 768 MB |
+| Text | Words | Wall Clock | Audio Duration | RTF | TTFA | Tok/s | Memory |
+|------|-------|------------|----------------|-----|------|-------|--------|
+| Short | 13 | 2.30 sec | 4.08 sec | **0.56** | 448 ms | 22.2 | 814 MB |
+| Medium | 53 | 10.08 sec | 17.84 sec | **0.57** | 452 ms | 22.1 | 817 MB |
+| Long | 115 | 110.63 sec | 163.84 sec | **0.68** | 456 ms | 18.5 | 841 MB |
+
+> Note: The 0.6B Base model generates significantly more frames per word than 1.7B models,
+> producing longer audio from the same text. The RTF increase on the long input reflects
+> the higher frame count (2048 frames vs ~529 for 1.7B).
+
+### 1.7B Base — CUDA (BF16)
+
+| Text | Words | Wall Clock | Audio Duration | RTF | TTFA | Tok/s | Memory |
+|------|-------|------------|----------------|-----|------|-------|--------|
+| Short | 13 | 2.25 sec | 3.12 sec | **0.72** | 590 ms | 17.3 | 761 MB |
+| Medium | 53 | 13.24 sec | 18.32 sec | **0.72** | 592 ms | 17.3 | 765 MB |
+| Long | 115 | 31.12 sec | 42.32 sec | **0.74** | 591 ms | 17.0 | 771 MB |
+
+### 1.7B CustomVoice — CUDA (BF16)
+
+| Text | Words | Wall Clock | Audio Duration | RTF | TTFA | Tok/s | Memory |
+|------|-------|------------|----------------|-----|------|-------|--------|
+| Short | 13 | 2.65 sec | 3.68 sec | **0.72** | 585 ms | 17.3 | 761 MB |
+| Medium | 53 | 24.11 sec | 33.12 sec | **0.73** | 588 ms | 17.2 | 766 MB |
+| Long | 115 | 45.18 sec | 60.32 sec | **0.75** | 590 ms | 16.7 | 769 MB |
+
+### 1.7B VoiceDesign — CUDA (BF16)
+
+| Text | Words | Wall Clock | Audio Duration | RTF | TTFA | Tok/s | Memory |
+|------|-------|------------|----------------|-----|------|-------|--------|
+| Short | 13 | 3.01 sec | 4.16 sec | **0.72** | 585 ms | 17.3 | 761 MB |
+| Medium | 53 | 14.73 sec | 20.48 sec | **0.72** | 585 ms | 17.4 | 764 MB |
+| Long | 115 | 53.78 sec | 71.36 sec | **0.75** | 590 ms | 16.6 | 778 MB |
 
 ### CPU (F32, no MKL/BLAS)
 
@@ -48,20 +77,23 @@ Each cell shows the average of 3 timed iterations after 2 warmup runs, executed 
 
 ### Summary
 
-| Metric | CPU | CUDA | Speedup |
-|--------|----:|-----:|--------:|
-| RTF (avg) | 5.96 | 0.79 | **7.5x** |
-| Tokens/sec | 2.1 | 15.9 | **7.6x** |
-| Time to first audio | — | 630ms | — |
-| Peak memory | 9.1 GB | 765 MB | 12x less |
+| Metric | CPU (1.7B) | 0.6B Base | 1.7B Base | 1.7B CustomVoice | 1.7B VoiceDesign |
+|--------|----------:|---------:|---------:|----------------:|----------------:|
+| RTF (avg) | 5.96 | **0.60** | 0.73 | 0.73 | 0.73 |
+| Tokens/sec | 2.1 | **20.9** | 17.2 | 17.1 | 17.1 |
+| TTFA | — | **452ms** | 591ms | 588ms | 587ms |
+| Peak memory | 9.1 GB | 841 MB | 771 MB | 769 MB | 778 MB |
 
 **CUDA delivers faster-than-real-time synthesis** across all text lengths.
 CPU is ~6x slower than real-time without BLAS acceleration — expected for
 a 1.7B parameter model in F32. Enabling MKL (x86) or Accelerate (macOS)
 would improve CPU performance significantly.
 
-TTFA (time to first audio) via streaming is stable at ~630ms regardless of
-input length, making the streaming API suitable for interactive use cases.
+TTFA (time to first audio) via streaming is stable at ~590ms (1.7B) or ~450ms (0.6B)
+regardless of input length, making the streaming API suitable for interactive use cases.
+
+The 0.6B model is ~20% faster than 1.7B variants with lower TTFA, at the cost
+of reduced voice quality.
 
 ## Micro-Benchmarks
 
@@ -108,13 +140,13 @@ cargo bench
 cargo bench -- sampling
 
 # End-to-end (requires model weights)
-cargo run --release --features cli --bin e2e_bench -- \
-  --model-dir <path-to-model> --device auto --iterations 3
+cargo run --release --features cuda,cli --bin e2e_bench -- \
+  --model-dir <path-to-model> --device cuda --iterations 3
 
 # With streaming TTFA measurement and JSON export
-cargo run --release --features cli --bin e2e_bench -- \
+cargo run --release --features cuda,cli --bin e2e_bench -- \
   --model-dir <path-to-model> --device cuda --streaming \
-  --json-output results.json
+  --warmup 2 --json-output results.json
 
 # Audio quality sanity check (optional)
 python scripts/quality_check.py output.wav "expected transcription"

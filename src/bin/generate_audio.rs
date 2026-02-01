@@ -355,8 +355,11 @@ fn run_voice_design(args: &Args) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Use chrome tracing when `profiling` feature is active, otherwise plain fmt.
+    let _profiling_guard = qwen3_tts::profiling::init();
+    if _profiling_guard.is_none() {
+        tracing_subscriber::fmt::init();
+    }
 
     let args = Args::parse();
     validate_args(&args)?;
@@ -400,15 +403,8 @@ fn main() -> Result<()> {
     let decoder_path = Path::new(&args.model_dir).join("speech_tokenizer/model.safetensors");
     let decoder_weights = load_weights(&decoder_path, &device)?;
 
-    // Load tokenizer
-    let tokenizer_dir = args.tokenizer_dir.unwrap_or_else(|| {
-        Path::new(&args.model_dir)
-            .parent()
-            .map(|p| p.join("tokenizer"))
-            .unwrap_or_else(|| Path::new("tokenizer").to_path_buf())
-            .to_string_lossy()
-            .to_string()
-    });
+    // Load tokenizer (defaults to model_dir, which has vocab.json + merges.txt)
+    let tokenizer_dir = args.tokenizer_dir.unwrap_or_else(|| args.model_dir.clone());
     println!("Loading tokenizer from {}...", tokenizer_dir);
     let text_tokenizer = tokenizer::TextTokenizer::from_pretrained(&tokenizer_dir)?;
 
@@ -615,7 +611,7 @@ fn main() -> Result<()> {
         let semantic_embed = talker.get_codec_embedding(semantic_token)?;
 
         // Generate 15 acoustic codes using code predictor
-        let acoustic_codes =
+        let (acoustic_codes, _) =
             code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
 
         if frame_idx < 5 || frame_idx == num_frames - 1 {

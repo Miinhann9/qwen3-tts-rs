@@ -3121,7 +3121,9 @@ fn test_autoregressive_generation() -> Result<()> {
 
     // First frame
     let semantic_embed = talker.get_codec_embedding(first_token_id)?;
-    let acoustic_codes = code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+    let acoustic_codes = code_predictor
+        .generate_acoustic_codes(&last_hidden, &semantic_embed)?
+        .0;
     println!(
         "  Frame 0: semantic={}, acoustics={:?}",
         first_token_id,
@@ -3146,8 +3148,9 @@ fn test_autoregressive_generation() -> Result<()> {
 
         // Generate acoustic tokens
         let semantic_embed = talker.get_codec_embedding(next_token_id)?;
-        let acoustic_codes =
-            code_predictor.generate_acoustic_codes(&last_hidden, &semantic_embed)?;
+        let acoustic_codes = code_predictor
+            .generate_acoustic_codes(&last_hidden, &semantic_embed)?
+            .0;
         println!(
             "  Frame {}: semantic={}, acoustics={:?}",
             frame_idx,

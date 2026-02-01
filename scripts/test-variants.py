@@ -575,12 +575,21 @@ def render_waveform(samples: np.ndarray, sr: int) -> str:
 # ── Combined plot (spectrogram + waveform) ─────────────────────────────
 
 
-def render_combined_plot(samples: np.ndarray, sr: int, title: str, out_path: Path) -> None:
-    """Save a stacked spectrogram + waveform PNG."""
+def render_combined_plot(
+    samples: np.ndarray,
+    sr: int,
+    title: str,
+    out_path: Path,
+    model_name: str = "",
+    seed: int | None = None,
+) -> None:
+    """Save a stacked spectrogram + waveform PNG with stats annotation."""
+    stats = compute_stats(samples, sr)
+
     fig, (ax_spec, ax_wave) = plt.subplots(
         2,
         1,
-        figsize=(10, 4),
+        figsize=(10, 4.4),
         height_ratios=[2, 1],
         gridspec_kw={"hspace": 0.08},
     )
@@ -618,6 +627,28 @@ def render_combined_plot(samples: np.ndarray, sr: int, title: str, out_path: Pat
     ax_wave.axhline(0, color="#333", linewidth=0.5)
     for spine in ax_wave.spines.values():
         spine.set_color("#333")
+
+    # Stats annotation bar
+    parts = [f"{stats.duration_s:.2f}s", f"{sr // 1000}kHz"]
+    parts.append(f"RMS {stats.rms_db:.1f}dB")
+    parts.append(f"Peak {stats.peak_db:.1f}dB")
+    parts.append(f"Silence {stats.silence_pct:.0f}%")
+    if model_name:
+        parts.append(model_name)
+    if seed is not None:
+        parts.append(f"seed {seed}")
+    stats_text = "  \u2502  ".join(parts)
+    fig.text(
+        0.5,
+        -0.01,
+        stats_text,
+        ha="center",
+        va="top",
+        fontsize=8,
+        fontfamily="monospace",
+        color="#888",
+        backgroundcolor=PLT_BG,
+    )
 
     fig.savefig(
         out_path, format="png", dpi=150, bbox_inches="tight", facecolor=PLT_BG, edgecolor="none"
@@ -766,7 +797,14 @@ def run_readme_samples(
         try:
             sr, data = wavfile.read(str(wav_path))
             samples = _normalize_samples(data)
-            render_combined_plot(samples, sr, sample["title"], png_path)
+            render_combined_plot(
+                samples,
+                sr,
+                sample["title"],
+                png_path,
+                model_name=model.name,
+                seed=seed,
+            )
             print(f"→ {png_path.name}")
         except Exception as e:
             print(f"(plot error: {e})")

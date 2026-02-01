@@ -4,7 +4,11 @@ use anyhow::{anyhow, Result};
 use std::path::Path;
 use tokenizers::Tokenizer;
 
+/// Pre-tokenizer regex matching Python's `Qwen2Converter` (from `convert_slow_tokenizer.py`).
+const PRETOKENIZE_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// Text tokenizer wrapping HuggingFace tokenizers
+#[derive(Debug)]
 pub struct TextTokenizer {
     tokenizer: Tokenizer,
     /// Beginning of sequence token ID
@@ -50,33 +54,66 @@ fn create_mock_tokenizer() -> Tokenizer {
 impl TextTokenizer {
     /// Load tokenizer from a local path or HuggingFace model ID.
     ///
-    /// Accepts a directory containing `tokenizer.json`, a direct file path,
-    /// or a HuggingFace repo ID (e.g. `"Qwen/Qwen2-0.5B"`).
+    /// Resolution order:
+    /// 1. Direct file path to `tokenizer.json`
+    /// 2. Directory containing `tokenizer.json`
+    /// 3. Directory containing `vocab.json` + `merges.txt` (Qwen2-style, built at runtime)
+    /// 4. HuggingFace Hub download (if `hub` feature enabled)
     pub fn from_pretrained(model_id: &str) -> Result<Self> {
         let path = Path::new(model_id);
 
-        // Direct file path
+        // 1. Direct file path
         if path.is_file() {
             return Self::from_file(path);
         }
 
-        // Directory containing tokenizer.json
-        let tokenizer_json = path.join("tokenizer.json");
-        if tokenizer_json.exists() {
-            return Self::from_file(&tokenizer_json);
+        // 2. Directory containing tokenizer.json
+        if path.join("tokenizer.json").exists() {
+            return Self::from_file(path.join("tokenizer.json"));
         }
 
-        // HF Hub download via hf-hub
+        // 3. Directory with vocab.json + merges.txt (Qwen2-style)
+        if path.join("vocab.json").exists() && path.join("merges.txt").exists() {
+            tracing::info!(
+                "Building tokenizer from vocab.json + merges.txt in '{}'",
+                model_id
+            );
+            return Self::from_vocab_and_merges(path);
+        }
+
+        // 4. Local dir exists but has neither → clear error
+        if path.is_dir() {
+            anyhow::bail!(
+                "No tokenizer files found in '{}'. Expected tokenizer.json or vocab.json + merges.txt.",
+                model_id
+            );
+        }
+
+        // 5. Treat as HF Hub repo ID
         #[cfg(feature = "hub")]
         {
             tracing::info!("Downloading tokenizer from HuggingFace Hub: {}", model_id);
             let api = hf_hub::api::sync::Api::new()
                 .map_err(|e| anyhow!("Failed to create HuggingFace API: {}", e))?;
-            let file = api
-                .model(model_id.to_string())
-                .get("tokenizer.json")
-                .map_err(|e| anyhow!("Failed to download tokenizer '{}': {}", model_id, e))?;
-            Self::from_file(&file)
+            let repo = api.model(model_id.to_string());
+
+            // Try tokenizer.json first
+            if let Ok(file) = repo.get("tokenizer.json") {
+                return Self::from_file(&file);
+            }
+
+            // Fall back to vocab.json + merges.txt (download both so they're cached locally)
+            let vocab = repo
+                .get("vocab.json")
+                .map_err(|e| anyhow!("Failed to download tokenizer from '{}': {}", model_id, e))?;
+            let _merges = repo
+                .get("merges.txt")
+                .map_err(|e| anyhow!("Failed to download merges from '{}': {}", model_id, e))?;
+            // Also grab tokenizer_config.json for special tokens (optional)
+            let _ = repo.get("tokenizer_config.json");
+
+            let vocab_dir = vocab.parent().unwrap_or(Path::new("."));
+            Self::from_vocab_and_merges(vocab_dir)
         }
 
         #[cfg(not(feature = "hub"))]
@@ -84,6 +121,61 @@ impl TextTokenizer {
             "No tokenizer found at '{}' and hub feature is disabled",
             model_id
         ))
+    }
+
+    /// Build tokenizer from `vocab.json` + `merges.txt`, replicating Python's `Qwen2Converter`.
+    ///
+    /// This matches the pipeline in `transformers/convert_slow_tokenizer.py`:
+    /// - Normalizer: NFC
+    /// - Pre-tokenizer: Split(regex, Isolated) + ByteLevel(add_prefix_space=false, use_regex=false)
+    /// - Model: BPE from vocab.json + merges.txt
+    /// - Post-processor: ByteLevel(trim_offsets=false)
+    /// - Decoder: ByteLevel
+    pub fn from_vocab_and_merges(dir: &Path) -> Result<Self> {
+        use tokenizers::models::bpe::BPE;
+        use tokenizers::normalizers::unicode::NFC;
+        use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+        use tokenizers::pre_tokenizers::sequence::Sequence;
+        use tokenizers::pre_tokenizers::split::Split;
+        use tokenizers::SplitDelimiterBehavior;
+
+        let vocab_path = dir.join("vocab.json");
+        let merges_path = dir.join("merges.txt");
+
+        // Build BPE model from files
+        let bpe = BPE::from_file(
+            &vocab_path.to_string_lossy(),
+            &merges_path.to_string_lossy(),
+        )
+        .unk_token("<|endoftext|>".to_string())
+        .byte_fallback(false)
+        .build()
+        .map_err(|e| anyhow!("Failed to build BPE from vocab.json + merges.txt: {}", e))?;
+
+        let mut tokenizer = Tokenizer::new(bpe);
+
+        // NFC normalizer
+        tokenizer.with_normalizer(Some(NFC));
+
+        // Pre-tokenizer: Split on regex (Isolated) + ByteLevel
+        let split = Split::new(PRETOKENIZE_REGEX, SplitDelimiterBehavior::Isolated, false)
+            .map_err(|e| anyhow!("Failed to create Split pre-tokenizer: {}", e))?;
+        let byte_level = ByteLevel::new(false, false, false);
+        tokenizer.with_pre_tokenizer(Some(Sequence::new(vec![split.into(), byte_level.into()])));
+
+        // Post-processor: ByteLevel (trim_offsets=false)
+        tokenizer.with_post_processor(Some(ByteLevel::new(false, false, false)));
+
+        // Decoder: ByteLevel
+        tokenizer.with_decoder(Some(ByteLevel::new(false, false, false)));
+
+        // Add special tokens from tokenizer_config.json if present
+        let config_path = dir.join("tokenizer_config.json");
+        if config_path.exists() {
+            add_special_tokens_from_config(&mut tokenizer, &config_path)?;
+        }
+
+        Self::from_tokenizer(tokenizer)
     }
 
     /// Load tokenizer from a local file
@@ -204,6 +296,66 @@ impl TextTokenizer {
 
         Ok(ids)
     }
+}
+
+/// Parse `tokenizer_config.json` and register special tokens on the tokenizer.
+///
+/// Looks for `added_tokens_decoder` (a map of ID → token info) which is the
+/// standard HuggingFace format for special tokens like `<|im_start|>`,
+/// `<|im_end|>`, `<|endoftext|>`, `<tts_pad>`, `<tts_text_bos>`, etc.
+fn add_special_tokens_from_config(tokenizer: &mut Tokenizer, config_path: &Path) -> Result<()> {
+    use tokenizers::AddedToken;
+
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| anyhow!("Failed to read tokenizer_config.json: {}", e))?;
+    let config: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| anyhow!("Failed to parse tokenizer_config.json: {}", e))?;
+
+    // Extract added_tokens_decoder: { "151643": { "content": "<|endoftext|>", "special": true, ... }, ... }
+    if let Some(added_tokens) = config
+        .get("added_tokens_decoder")
+        .and_then(|v| v.as_object())
+    {
+        let mut special_tokens = Vec::new();
+
+        for (_id_str, token_info) in added_tokens {
+            let content = match token_info.get("content").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => continue,
+            };
+            let is_special = token_info
+                .get("special")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if is_special {
+                let mut token = AddedToken::from(content, true);
+                if let Some(lstrip) = token_info.get("lstrip").and_then(|v| v.as_bool()) {
+                    token = token.lstrip(lstrip);
+                }
+                if let Some(rstrip) = token_info.get("rstrip").and_then(|v| v.as_bool()) {
+                    token = token.rstrip(rstrip);
+                }
+                if let Some(normalized) = token_info.get("normalized").and_then(|v| v.as_bool()) {
+                    token = token.normalized(normalized);
+                }
+                if let Some(single_word) = token_info.get("single_word").and_then(|v| v.as_bool()) {
+                    token = token.single_word(single_word);
+                }
+                special_tokens.push(token);
+            }
+        }
+
+        if !special_tokens.is_empty() {
+            tracing::debug!(
+                "Adding {} special tokens from tokenizer_config.json",
+                special_tokens.len()
+            );
+            tokenizer.add_special_tokens(&special_tokens);
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -359,5 +511,14 @@ mod tests {
         // Empty input should give empty output
         assert!(ids.is_empty());
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_from_pretrained_dir_no_tokenizer_files() {
+        // A directory that exists but has no tokenizer files should give a clear error
+        let result = TextTokenizer::from_pretrained("/tmp");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("No tokenizer files found"));
     }
 }

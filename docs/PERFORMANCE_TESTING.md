@@ -121,20 +121,32 @@ done
 
 ### Per-stage tracing
 
-The codebase already uses `tracing`. Add `tracing::info_span!` around each pipeline stage:
+**Implemented.** The pipeline is instrumented with feature-gated tracing spans
+(`#[cfg(feature = "profiling")]`) and a `SynthesisTiming` API for wall-clock
+stage breakdowns. See [PROFILING.md](PROFILING.md) for usage details.
 
-```rust
-let _span = tracing::info_span!("talker_generate").entered();
-// ... talker generation ...
+Key spans: `synthesize`, `prefill`, `generate_frames`, `code_predictor`,
+`talker_step`, `sampling`, `top_k`, `top_p`, `decode`, `code_predictor_inner`.
 
-let _span = tracing::info_span!("code_predict").entered();
-// ... code prediction ...
+GPU→CPU sync points are marked with `tracing::trace!(target: "gpu_sync", ...)`.
 
-let _span = tracing::info_span!("decode_12hz").entered();
-// ... decoder ...
+### E2E benchmarks
+
+**Implemented.** The `e2e_bench` binary (`benches/e2e_bench.rs`, requires `cli` feature)
+supports:
+- Per-stage timing breakdown (prefill / generation / decode)
+- Streaming TTFA measurement (`--streaming`)
+- JSON output (`--json-output results.json`)
+- Configurable warmup and iterations
+- Memory tracking via CUDA APIs
+
+Run all 4 variants sequentially:
+```bash
+for model in 0.6B-Base 1.7B-Base 1.7B-CustomVoice 1.7B-VoiceDesign; do
+  cargo run --release --features cuda,cli --bin e2e_bench -- \
+    --model-dir test_data/models/$model --iterations 3 --warmup 2 --streaming
+done
 ```
-
-Collect with `tracing-timing` or export to JSON via `tracing-subscriber`'s JSON layer. This gives per-stage breakdowns without separate benchmark harnesses.
 
 ### Memory profiling
 
