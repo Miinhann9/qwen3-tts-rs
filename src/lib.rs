@@ -1078,6 +1078,46 @@ impl Qwen3TTS {
         StreamingSession::new(self, &input_ids, speaker, language, options)
     }
 
+    /// Synthesize speech using a text-described voice (VoiceDesign model), streaming.
+    ///
+    /// Same as [`Self::synthesize_voice_design`] but returns a streaming session
+    /// that yields audio chunks as they are generated.
+    ///
+    /// The instruct text is tokenized with ChatML framing:
+    /// `<|im_start|>user\n{instruct}<|im_end|>\n`
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - Text to synthesize
+    /// * `instruct` - Natural language voice description (e.g., "A cheerful young female voice")
+    /// * `language` - Target language
+    /// * `options` - Synthesis options (temperature, top_k, chunk_frames, etc.)
+    pub fn synthesize_voice_design_streaming(
+        &self,
+        text: &str,
+        instruct: &str,
+        language: Language,
+        options: SynthesisOptions,
+    ) -> Result<StreamingSession<'_>> {
+        if let Some(ref mt) = self.model_type {
+            if *mt != ModelType::VoiceDesign {
+                tracing::warn!(
+                    "Using VoiceDesign synthesis on a {:?} model. This model was not trained \
+                     for text-described voice conditioning — output may be unpredictable.",
+                    mt
+                );
+            }
+        }
+
+        let input_ids = self.text_tokenizer.encode(text)?;
+
+        // Tokenize instruct with ChatML user framing: <|im_start|>user\n{instruct}<|im_end|>\n
+        let instruct_text = format!("<|im_start|>user\n{}<|im_end|>\n", instruct);
+        let instruct_ids = self.text_tokenizer.encode(&instruct_text)?;
+
+        StreamingSession::new_voice_design(self, &input_ids, &instruct_ids, language, options)
+    }
+
     // ── Voice cloning API ─────────────────────────────────────────────────
 
     /// Create a voice clone prompt from reference audio.
@@ -1475,18 +1515,84 @@ impl<'a> StreamingSession<'a> {
         language: Language,
         options: SynthesisOptions,
     ) -> Result<Self> {
-        let mut sampling_ctx = generation::SamplingContext::new(options.seed);
+        let sampling_ctx = generation::SamplingContext::new(options.seed);
         let config = options.to_gen_config();
 
         let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
             model.build_trailing_text(input_ids)?;
 
-        // Prefill with CustomVoice format
         let mut kv_caches = model.talker.new_kv_caches(config.max_new_tokens + 256);
-        let (hidden, logits) =
+        let prefill_result =
             model
                 .talker
                 .prefill_custom_voice(input_ids, speaker, language, &mut kv_caches)?;
+
+        Self::from_prefill(
+            model,
+            config,
+            sampling_ctx,
+            kv_caches,
+            prefill_result,
+            trailing_text_hidden,
+            trailing_text_len,
+            tts_pad_embed,
+            options.chunk_frames,
+        )
+    }
+
+    /// Create a streaming session using voice design (text-described voice).
+    ///
+    /// Uses `prefill_voice_design` instead of `prefill_custom_voice` to condition
+    /// on a natural language voice description rather than a predefined speaker.
+    fn new_voice_design(
+        model: &'a Qwen3TTS,
+        input_ids: &[u32],
+        instruct_ids: &[u32],
+        language: Language,
+        options: SynthesisOptions,
+    ) -> Result<Self> {
+        let sampling_ctx = generation::SamplingContext::new(options.seed);
+        let config = options.to_gen_config();
+
+        let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
+            model.build_trailing_text(input_ids)?;
+
+        let mut kv_caches = model.talker.new_kv_caches(config.max_new_tokens + 256);
+        let prefill_result =
+            model
+                .talker
+                .prefill_voice_design(input_ids, instruct_ids, language, &mut kv_caches)?;
+
+        Self::from_prefill(
+            model,
+            config,
+            sampling_ctx,
+            kv_caches,
+            prefill_result,
+            trailing_text_hidden,
+            trailing_text_len,
+            tts_pad_embed,
+            options.chunk_frames,
+        )
+    }
+
+    /// Shared post-prefill constructor.
+    ///
+    /// Extracts `last_hidden` from the prefill result, builds the suppression and
+    /// penalty masks, samples the first semantic token, and assembles the session.
+    #[allow(clippy::too_many_arguments)]
+    fn from_prefill(
+        model: &'a Qwen3TTS,
+        config: generation::GenerationConfig,
+        mut sampling_ctx: generation::SamplingContext,
+        kv_caches: Vec<AnyKVCache>,
+        prefill_result: (Tensor, Tensor),
+        trailing_text_hidden: Tensor,
+        trailing_text_len: usize,
+        tts_pad_embed: Tensor,
+        chunk_frames: usize,
+    ) -> Result<Self> {
+        let (hidden, logits) = prefill_result;
         let prefill_len = hidden.dim(1)?;
         let last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
 
@@ -1526,7 +1632,7 @@ impl<'a> StreamingSession<'a> {
             current_token_tensor: if done { None } else { Some(first_token) },
             frames_generated: 0,
             frame_buffer: Vec::new(),
-            chunk_frames: options.chunk_frames,
+            chunk_frames,
             done,
             trailing_text_hidden,
             trailing_text_len,
@@ -1981,5 +2087,49 @@ mod tests {
     fn test_compute_dtype_for_device() {
         let dtype = compute_dtype_for_device(&Device::Cpu);
         assert_eq!(dtype, DType::F32);
+    }
+
+    #[test]
+    fn test_update_penalty_mask() {
+        let device = Device::Cpu;
+        let vocab_size = 3072;
+        let mut mask = Tensor::zeros((1, vocab_size), DType::F32, &device).unwrap();
+
+        Qwen3TTS::update_penalty_mask(&mut mask, 42, vocab_size).unwrap();
+
+        let vals: Vec<f32> = mask.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(vals[42], 1.0);
+        // Neighboring positions should be untouched
+        assert_eq!(vals[41], 0.0);
+        assert_eq!(vals[43], 0.0);
+    }
+
+    #[test]
+    fn test_update_penalty_mask_out_of_range() {
+        let device = Device::Cpu;
+        let vocab_size = 3072;
+        let mut mask = Tensor::zeros((1, vocab_size), DType::F32, &device).unwrap();
+
+        // Token beyond vocab_size should be a no-op (no panic)
+        Qwen3TTS::update_penalty_mask(&mut mask, 9999, vocab_size).unwrap();
+
+        let sum: f32 = mask.sum_all().unwrap().to_scalar().unwrap();
+        assert_eq!(sum, 0.0);
+    }
+
+    #[test]
+    fn test_suppression_mask_deterministic() {
+        let device = Device::Cpu;
+        let vocab = codec_tokens::CODEC_VOCAB_SIZE;
+        let mask1 = generation::build_suppression_mask(vocab, CODEC_EOS_TOKEN_ID, &device).unwrap();
+        let mask2 = generation::build_suppression_mask(vocab, CODEC_EOS_TOKEN_ID, &device).unwrap();
+
+        // Apply both masks to uniform logits and verify identical output
+        let logits = Tensor::ones((1, vocab), DType::F32, &device).unwrap();
+        let out1 = generation::apply_token_suppression_with_mask(&logits, &mask1).unwrap();
+        let out2 = generation::apply_token_suppression_with_mask(&logits, &mask2).unwrap();
+        let v1: Vec<f32> = out1.flatten_all().unwrap().to_vec1().unwrap();
+        let v2: Vec<f32> = out2.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(v1, v2);
     }
 }
